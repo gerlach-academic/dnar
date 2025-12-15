@@ -1,29 +1,42 @@
 import math
-
+import os
 import networkx as nx
 import numpy as np
 import torch
 import tqdm
+from torch.utils.data import Dataset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
+from scipy.spatial import distance_matrix
 
 from configs import base_config
+import argparse
 
+# -----------------------------------------------------------------------------
+# 1. PROBLEM INSTANCE WITH PLANNING SUPPORT
+# -----------------------------------------------------------------------------
 
 class ProblemInstance:
-    def __init__(self, adj, start, weighted, randomness):
+    def __init__(self, adj, start, goal, weighted, randomness, pos=None):
         self.adj = np.copy(adj)
         self.start = start
+        self.goal = goal  # NEW: Goal node for planning
         self.weighted = weighted
-        self.randomness = np.copy(randomness)
+        self.randomness = np.copy(randomness) if randomness is not None else None
         self.edge_index = np.stack(np.nonzero(adj + np.eye(adj.shape[0])))
 
         self.out_nodes = [[] for _ in range(adj.shape[0])]
         for x, y in self.edge_index[:, self.edge_index[0] != self.edge_index[1]].T:
             self.out_nodes[x].append(y)
-        random_pos = np.random.uniform(0.0, 1.0, (adj.shape[0],))
-        self.pos = random_pos[np.argsort(random_pos)]
-
+        
+        # Store coordinates. 
+        # If standard CLRS (ER graph), this is just random noise 1D.
+        # If Planning (Grid/Roadmap), this is 2D coords (y,x).
+        if pos is not None:
+            self.pos = pos
+        else:
+            random_pos = np.random.uniform(0.0, 1.0, (adj.shape[0],))
+            self.pos = random_pos[np.argsort(random_pos)]
 
 def push_states(
     node_states, edge_states, scalars, cur_step_nodes, cur_step_edges, cur_step_scalars
@@ -32,6 +45,17 @@ def push_states(
     edge_states.append(np.stack(cur_step_edges, axis=-1))
     scalars.append(np.stack(cur_step_scalars, axis=-1))
 
+# Helper to keep legacy algorithms (BFS/DFS) from crashing on 2D inputs
+def get_scalar_pos_for_legacy(instance):
+    # If pos is 2D (planning map), just take the first coord for the 'scalar' hint
+    # This keeps dimensions compatible with standard CLRS models.
+    if instance.pos.ndim > 1:
+        return instance.pos[:, 0]
+    return instance.pos
+
+# -----------------------------------------------------------------------------
+# 2. ALGORITHMS
+# -----------------------------------------------------------------------------
 
 def bfs(instance: ProblemInstance):
     n = instance.adj.shape[0]
@@ -43,17 +67,14 @@ def bfs(instance: ProblemInstance):
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    cur_scalars = instance.pos[instance.edge_index[0]]
+    # Use helper for 2D compatibility
+    cur_scalars = get_scalar_pos_for_legacy(instance)[instance.edge_index[0]]
 
     visited[instance.start] = 1
 
     push_states(
-        node_states,
-        edge_states,
-        scalars,
-        (visited,),
-        (pointers, self_loops),
-        (cur_scalars,),
+        node_states, edge_states, scalars,
+        (visited,), (pointers, self_loops), (cur_scalars,),
     )
 
     layer = [instance.start]
@@ -71,29 +92,20 @@ def bfs(instance: ProblemInstance):
                     pointers[out][node] = 1
         layer = next_layer
         push_states(
-            node_states,
-            edge_states,
-            scalars,
-            (visited,),
-            (pointers, self_loops),
-            (cur_scalars,),
+            node_states, edge_states, scalars,
+            (visited,), (pointers, self_loops), (cur_scalars,),
         )
 
     while len(node_states) < n:
         push_states(
-            node_states,
-            edge_states,
-            scalars,
-            (visited,),
-            (pointers, self_loops),
-            (cur_scalars,),
+            node_states, edge_states, scalars,
+            (visited,), (pointers, self_loops), (cur_scalars,),
         )
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 
 def dfs(instance: ProblemInstance):
     n = instance.adj.shape[0]
-
     node_states = []
     edge_states = []
     scalars = []
@@ -107,89 +119,63 @@ def dfs(instance: ProblemInstance):
     stack_update = np.zeros((n, n), dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    cur_scalars = instance.pos[instance.edge_index[0]]
+    cur_scalars = get_scalar_pos_for_legacy(instance)[instance.edge_index[0]]
 
     top_of_the_stack[instance.start] = 1
     not_in_the_stack[instance.start] = 0
 
     push_states(
-        node_states,
-        edge_states,
-        scalars,
+        node_states, edge_states, scalars,
         (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
         (pointers, stack_update, self_loops),
         (cur_scalars,),
     )
 
     def rec_dfs(current_node, prev_node=-1):
-        assert top_of_the_stack[current_node] == 1
-        assert prev_node == -1 or in_the_stack[prev_node] == 1
         for out in instance.out_nodes[current_node]:
             if not_in_the_stack[out]:
                 in_the_stack[current_node] = 1
-
                 stack_update[current_node][out] = 1
                 push_states(
-                    node_states,
-                    edge_states,
-                    scalars,
+                    node_states, edge_states, scalars,
                     (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
-                    (pointers, stack_update, self_loops),
-                    (cur_scalars,),
+                    (pointers, stack_update, self_loops), (cur_scalars,),
                 )
                 stack_update[current_node][out] = 0
-
                 top_of_the_stack[current_node] = 0
                 top_of_the_stack[out] = 1
-
                 not_in_the_stack[out] = 0
                 pointers[out][current_node] = 1
                 pointers[out][out] = 0
-
                 stack_update[out][current_node] = 1
                 push_states(
-                    node_states,
-                    edge_states,
-                    scalars,
+                    node_states, edge_states, scalars,
                     (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
-                    (pointers, stack_update, self_loops),
-                    (cur_scalars,),
+                    (pointers, stack_update, self_loops), (cur_scalars,),
                 )
                 stack_update[out][current_node] = 0
-
                 rec_dfs(out, current_node)
-
                 top_of_the_stack[current_node] = 1
                 top_of_the_stack[out] = 0
                 in_the_stack[current_node] = 0
                 pre_end[out] = 0
-
                 stack_update[current_node][out] = 1
                 push_states(
-                    node_states,
-                    edge_states,
-                    scalars,
+                    node_states, edge_states, scalars,
                     (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
-                    (pointers, stack_update, self_loops),
-                    (cur_scalars,),
+                    (pointers, stack_update, self_loops), (cur_scalars,),
                 )
                 stack_update[current_node][out] = 0
-
         pre_end[current_node] = 1
-
         stack_update[current_node][current_node] = 1
         push_states(
-            node_states,
-            edge_states,
-            scalars,
+            node_states, edge_states, scalars,
             (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
-            (pointers, stack_update, self_loops),
-            (cur_scalars,),
+            (pointers, stack_update, self_loops), (cur_scalars,),
         )
         stack_update[current_node][current_node] = 0
 
     rec_dfs(instance.start)
-
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 
@@ -201,36 +187,37 @@ def mst(instance: ProblemInstance):
 
     in_queue = np.zeros(n, dtype=np.int32)
     in_tree = np.zeros(n, dtype=np.int32)
-
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    node_scalars = instance.pos
+    # MST uses pos values as the "key", so we copy them.
+    # Note: MST on 2D coordinates usually implies Euclidean distance as weights, 
+    # but here we follow the CLRS 'Prim' logic where keys are scalars.
+    node_scalars = np.copy(get_scalar_pos_for_legacy(instance))
 
     def compute_current_scalars(node_scalars):
-        scalars = instance.adj[instance.edge_index[0], instance.edge_index[1]]
-        scalars[instance.edge_index[0] == instance.edge_index[1]] = node_scalars
-        return scalars
+        s = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+        s[instance.edge_index[0] == instance.edge_index[1]] = node_scalars
+        return s
 
     in_queue[instance.start] = 1
     node_scalars[instance.start] = 0.0
 
     push_states(
-        node_states,
-        edge_states,
-        scalars,
-        (in_queue, in_tree),
-        (pointers, self_loops),
+        node_states, edge_states, scalars,
+        (in_queue, in_tree), (pointers, self_loops),
         (compute_current_scalars(node_scalars),),
     )
 
     for _ in range(1, n):
+        # 1e3 penalty pushes non-queue nodes to the end (Simulating Infinity)
         node = np.argsort(node_scalars + (1.0 - in_queue) * 1e3)[0]
         assert in_queue[node] == 1
         in_tree[node] = 1
         in_queue[node] = 0
 
         for out in instance.out_nodes[node]:
+            # Prim's update
             if in_tree[out] == 0 and (
                 in_queue[out] == 0 or instance.adj[node][out] < node_scalars[out]
             ):
@@ -240,11 +227,8 @@ def mst(instance: ProblemInstance):
                 in_queue[out] = 1
 
         push_states(
-            node_states,
-            edge_states,
-            scalars,
-            (in_queue, in_tree),
-            (pointers, self_loops),
+            node_states, edge_states, scalars,
+            (in_queue, in_tree), (pointers, self_loops),
             (compute_current_scalars(node_scalars),),
         )
 
@@ -259,149 +243,255 @@ def dijkstra(instance: ProblemInstance):
 
     in_queue = np.zeros(n, dtype=np.int32)
     in_tree = np.zeros(n, dtype=np.int32)
-
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    node_scalars = instance.pos
+    # NO INFINITY: Initialize with 0.0 (acting as garbage/unknown).
+    # We rely on 'in_queue' to tell the network that these 0s are not valid yet.
+    node_dist = np.zeros(n, dtype=np.float32)
 
-    def compute_current_scalars(node_scalars):
-        scalars = instance.adj[instance.edge_index[0], instance.edge_index[1]]
-        scalars[instance.edge_index[0] == instance.edge_index[1]] = node_scalars
-        return scalars
+    def compute_current_scalars(dist_vals):
+        # Edge features = Weights. Self-loops = Distance Estimates.
+        s = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+        s[instance.edge_index[0] == instance.edge_index[1]] = dist_vals
+        return s
 
     in_queue[instance.start] = 1
-    node_scalars[instance.start] = 0
-
+    # node_dist[start] is already 0, which is correct for the start node.
+    
     push_states(
-        node_states,
-        edge_states,
-        scalars,
-        (in_queue, in_tree),
-        (pointers, self_loops),
-        (compute_current_scalars(node_scalars),),
+        node_states, edge_states, scalars,
+        (in_queue, in_tree), (pointers, self_loops),
+        (compute_current_scalars(node_dist),),
     )
 
-    for _ in range(1, n):
-        node = np.argsort(node_scalars + (1.0 - in_queue) * 1e3)[0]
-        assert in_queue[node] == 1
-
+    for _ in range(n):
+        # Priority Queue selection:
+        # Add 1e9 to nodes NOT in queue. This makes them "Infinite" to argsort.
+        candidates = node_dist + (1.0 - in_queue) * 1e9
+        
+        # If min is >= 1e9, queue is empty.
+        if np.min(candidates) >= 1e9: 
+            break
+        
+        node = np.argmin(candidates)
+        
         in_tree[node] = 1
         in_queue[node] = 0
 
         for out in instance.out_nodes[node]:
-            if in_tree[out] == 0 and (
-                in_queue[out] == 0
-                or node_scalars[node] + instance.adj[node][out] < node_scalars[out]
-            ):
+            new_dist = node_dist[node] + instance.adj[node][out]
+            
+            # Relax edge
+            # If out is not in tree AND (not in queue OR found a shorter path)
+            if in_tree[out] == 0 and (in_queue[out] == 0 or new_dist < node_dist[out]):
                 pointers[out] = np.zeros(n, dtype=np.int32)
                 pointers[out][node] = 1
-                node_scalars[out] = node_scalars[node] + instance.adj[node][out]
+                node_dist[out] = new_dist
                 in_queue[out] = 1
 
         push_states(
-            node_states,
-            edge_states,
-            scalars,
-            (in_queue, in_tree),
-            (pointers, self_loops),
-            (compute_current_scalars(node_scalars),),
+            node_states, edge_states, scalars,
+            (in_queue, in_tree), (pointers, self_loops),
+            (compute_current_scalars(node_dist),),
+        )
+
+    # Pad trajectory
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (in_queue, in_tree), (pointers, self_loops),
+            (compute_current_scalars(node_dist),),
         )
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 
 def mis(instance: ProblemInstance):
+    # MIS uses randomness, logic mostly independent of position
     n = instance.adj.shape[0]
-
     node_states = []
     edge_states = []
     scalars = []
 
     alive = np.ones(n, dtype=np.int32)
     in_mis = np.zeros(n, dtype=np.int32)
-
     self_loops = np.eye(n, dtype=np.int32)
 
     def compute_current_scalars():
-        random_numbers = instance.randomness[len(node_states) // 2]
+        # Safeguard index for batching
+        idx = min(len(node_states) // 2, len(instance.randomness) - 1)
+        random_numbers = instance.randomness[idx]
         return random_numbers[instance.edge_index[0]]
 
     push_states(
-        node_states,
-        edge_states,
-        scalars,
-        (in_mis, alive),
-        (self_loops,),
-        (compute_current_scalars(),),
+        node_states, edge_states, scalars,
+        (in_mis, alive), (self_loops,), (compute_current_scalars(),),
     )
+    
     while np.any(alive):
-        random_numbers = instance.randomness[len(node_states) // 2]
+        idx = min(len(node_states) // 2, len(instance.randomness) - 1)
+        random_numbers = instance.randomness[idx]
 
         for node in filter(lambda x: alive[x], range(n)):
-            if random_numbers[node] < random_numbers[
-                np.logical_and(instance.adj[node], alive)
-            ].min(initial=1.0):
+            neighbors = instance.adj[node].astype(bool)
+            neigh_alive = np.logical_and(neighbors, alive)
+            
+            if np.any(neigh_alive):
+                min_neigh = random_numbers[neigh_alive].min()
+            else:
+                min_neigh = 2.0
+            
+            if random_numbers[node] < min_neigh:
                 in_mis[node] = 1
             else:
                 in_mis[node] = 0
 
         push_states(
-            node_states,
-            edge_states,
-            scalars,
-            (in_mis, alive),
-            (self_loops,),
-            (compute_current_scalars(),),
+            node_states, edge_states, scalars,
+            (in_mis, alive), (self_loops,), (compute_current_scalars(),),
         )
 
         new_alive = np.copy(alive)
         for node in filter(lambda x: alive[x], range(n)):
-            if in_mis[node] or np.any(in_mis[instance.adj[node].astype(bool)]):
+            neighbors = instance.adj[node].astype(bool)
+            # If self or any neighbor is in MIS, node dies
+            if in_mis[node] or np.any(in_mis[np.logical_and(neighbors, in_mis.astype(bool))]):
                 new_alive[node] = 0
             else:
                 new_alive[node] = 1
 
         alive = new_alive
         push_states(
-            node_states,
-            edge_states,
-            scalars,
-            (in_mis, alive),
-            (self_loops,),
-            (compute_current_scalars(),),
+            node_states, edge_states, scalars,
+            (in_mis, alive), (self_loops,), (compute_current_scalars(),),
         )
 
     while len(node_states) < n:
         push_states(
-            node_states,
-            edge_states,
-            scalars,
-            (in_mis, alive),
-            (self_loops,),
-            (compute_current_scalars(),),
+            node_states, edge_states, scalars,
+            (in_mis, alive), (self_loops,), (compute_current_scalars(),),
         )
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 
+def a_star(instance: ProblemInstance):
+    """
+    NEW: A* Search
+    Uses instance.pos (coordinates) and instance.goal for heuristics.
+    Hints: pred (pointer), f_score (scalar), in_open, in_closed, is_goal (masks).
+    """
+    n = instance.adj.shape[0]
+    node_states = []
+    edge_states = []
+    scalars = []
+
+    in_open = np.zeros(n, dtype=np.int32)
+    in_closed = np.zeros(n, dtype=np.int32)
+    is_goal = np.zeros(n, dtype=np.int32)
+    is_goal[instance.goal] = 1
+
+    pointers = np.eye(n, dtype=np.int32)
+    self_loops = np.eye(n, dtype=np.int32)
+
+    # Heuristic: Euclidean
+    if instance.pos.ndim == 2:
+        h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
+    else:
+        h_vals = np.abs(instance.pos - instance.pos[instance.goal])
+
+    # Initialize f_score to 0 (garbage), will be masked by in_open
+    g_score = np.zeros(n)
+    f_score = np.zeros(n)
+
+    def compute_current_scalars(f_vals):
+        # Scalar Hint: f_score on self loops, weights on edges
+        s = instance.adj[instance.edge_index[0], instance.edge_index[1]] # Weights
+        mask_loops = instance.edge_index[0] == instance.edge_index[1]
+        s[mask_loops] = f_vals
+        return s
+
+    g_score[instance.start] = 0
+    f_score[instance.start] = h_vals[instance.start]
+    in_open[instance.start] = 1
+
+    push_states(
+        node_states, edge_states, scalars,
+        (in_open, in_closed, is_goal), 
+        (pointers, self_loops),
+        (compute_current_scalars(f_score),),
+    )
+
+    for _ in range(n):
+        # Priority: f_score. Unvisited nodes (in_open=0) get +1e9 penalty
+        candidates = f_score + (1.0 - in_open) * 1e9
+        
+        if np.min(candidates) >= 1e9: break 
+        
+        current = np.argmin(candidates)
+        
+        if current == instance.goal:
+            in_open[current] = 0
+            in_closed[current] = 1
+            push_states(
+                node_states, edge_states, scalars,
+                (in_open, in_closed, is_goal), (pointers, self_loops),
+                (compute_current_scalars(f_score),),
+            )
+            break
+
+        in_open[current] = 0
+        in_closed[current] = 1
+
+        for neighbor in instance.out_nodes[current]:
+            if in_closed[neighbor]: continue
+
+            tentative_g = g_score[current] + instance.adj[current][neighbor]
+            
+            # If neighbor not in open, or we found a better path
+            if in_open[neighbor] == 0 or tentative_g < g_score[neighbor]:
+                pointers[neighbor] = np.zeros(n, dtype=np.int32)
+                pointers[neighbor][current] = 1
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = g_score[neighbor] + h_vals[neighbor]
+                in_open[neighbor] = 1
+        
+        push_states(
+            node_states, edge_states, scalars,
+            (in_open, in_closed, is_goal), (pointers, self_loops),
+            (compute_current_scalars(f_score),),
+        )
+
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (in_open, in_closed, is_goal), (pointers, self_loops),
+            (compute_current_scalars(f_score),),
+        )
+        
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
+
+
+# -----------------------------------------------------------------------------
+# 3. SAMPLERS
+# -----------------------------------------------------------------------------
+
 def er_probabilities(n):
     base = math.log(n) / n
     return (base, base * 3)
 
-
 class ErdosRenyiGraphSampler:
-    def __init__(self, config: base_config.Config):
+    def __init__(self, config):
         self.weighted = config.edge_weights
         self.generate_random_numbers = config.generate_random_numbers
 
     def __call__(self, num_nodes):
         p_segment = er_probabilities(num_nodes)
         p = p_segment[0] + np.random.rand() * (p_segment[1] - p_segment[0])
-
-        random_numbers = None
+        
         start = np.random.randint(0, num_nodes)
-
+        
         while True:
             adj = np.triu(np.random.binomial(1, p, size=(num_nodes, num_nodes)), k=1)
             adj += adj.T
@@ -410,18 +500,176 @@ class ErdosRenyiGraphSampler:
                 w = np.triu(np.random.uniform(0.0, 1.0, (num_nodes, num_nodes)), k=1)
                 w *= adj
                 adj = w + w.T
+            
+            random_numbers = None
             if self.generate_random_numbers:
-                random_numbers = np.random.rand(
-                    num_nodes, num_nodes
-                )  # steps count bounded by num_nodes
-            instance = ProblemInstance(adj, start, self.weighted, random_numbers)
+                random_numbers = np.random.rand(num_nodes, num_nodes)
 
-            is_connected = np.all(bfs(instance)[0][-1, :, 0] == 1)
-            if not is_connected:
-                continue
+            goal = (start + 1) % num_nodes # Dummy
+            instance = ProblemInstance(adj, start, goal, self.weighted, random_numbers)
+            
+            # Use new BFS which handles 2D pos cleanly
+            trace, _, _ = bfs(instance)
+            if np.all(trace[-1, :, 0] == 1):
+                return instance
 
-            return instance
+class GeometricGraphSampler:
+    """
+    Generates Random Geometric Graphs (RGG).
+    Nodes are placed randomly in 2D space [0,1]^2.
+    Edges are created between nodes closer than a radius 'r'.
+    Edge weights are the Euclidean distance.
+    """
+    def __init__(self, config):
+        self.weighted = True  # A* requires weighted edges
+        
+    def __call__(self, num_nodes):
+        # 1. Generate random coordinates in [0, 1]
+        pos = np.random.rand(num_nodes, 2)
+        
+        # 2. Calculate Distance Matrix
+        dist_mat = distance_matrix(pos, pos)
+        
+        # 3. Connect nodes based on a radius threshold
+        # r = sqrt(2 * log(n) / n) is the theoretical threshold for connectivity
+        radius = math.sqrt(2 * math.log(num_nodes) / num_nodes)
+        
+        # Create adjacency matrix: 0 if far, dist if close
+        adj = np.zeros((num_nodes, num_nodes))
+        mask = (dist_mat < radius) & (dist_mat > 0)
+        adj[mask] = dist_mat[mask]
+        
+        # 4. Enforce Connectivity (k-NN fallback)
+        # Random radius graphs often have isolated nodes. 
+        # We connect every node to its 'k' nearest neighbors to ensure 
+        # the graph is navigable for A*.
+        k = 3
+        # Get indices of k nearest neighbors (excluding self at col 0)
+        knn_indices = np.argsort(dist_mat, axis=1)[:, 1:k+1]
+        
+        for i in range(num_nodes):
+            for neighbor in knn_indices[i]:
+                d = dist_mat[i, neighbor]
+                adj[i, neighbor] = d
+                adj[neighbor, i] = d # Undirected
 
+        # 5. Extract Largest Component
+        # Even with k-NN, we might have disjoint islands.
+        G = nx.from_numpy_array(adj)
+        largest_cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(largest_cc).copy()
+        
+        # Relabel nodes to 0..N_sub-1
+        G = nx.convert_node_labels_to_integers(G)
+        final_n = G.number_of_nodes()
+        
+        # If the graph ended up too small (e.g., < 50% of requested size), retry
+        if final_n < num_nodes * 0.5:
+            return self.__call__(num_nodes)
+
+        # 6. Extract final data
+        final_adj = nx.to_numpy_array(G)
+        
+        # We need to map the new indices back to the original positions
+        # Since we just used convert_node_labels_to_integers on a subgraph,
+        # we need to be careful. The easiest way is to pass 'pos' into 
+        # the graph attributes before sub-graphing.
+        node_idx_map = list(largest_cc) # The original indices
+        final_pos = pos[node_idx_map]
+        
+        # 7. Select Start and Goal
+        # For A* training to be effective, start and goal should be reasonably far apart
+        start = np.random.randint(0, final_n)
+        goal = np.random.randint(0, final_n)
+        
+        # Ensure start != goal and maybe ensure they aren't directly connected (optional)
+        while start == goal:
+            goal = np.random.randint(0, final_n)
+
+        # Return the ProblemInstance compatible with your code
+        # Pass final_pos so the A* function can calculate h(n)
+        return ProblemInstance(
+            adj=final_adj, 
+            start=start, 
+            goal=goal, 
+            weighted=True, 
+            randomness=None, 
+            pos=final_pos
+        )
+
+class GridGraphSampler:
+    def __init__(self, config):
+        self.weighted = True 
+        
+    def __call__(self, num_nodes):
+        side = int(math.sqrt(num_nodes))
+        G = nx.grid_2d_graph(side, side)
+        
+        # Remove ~20% nodes
+        nodes_to_remove = [n for n in G.nodes() if np.random.rand() < 0.2]
+        G.remove_nodes_from(nodes_to_remove)
+        
+        if len(G) == 0: return self.__call__(num_nodes)
+        largest_cc = max(nx.connected_components(G), key=len)
+        G = G.subgraph(largest_cc).copy()
+        
+        G = nx.convert_node_labels_to_integers(G, label_attribute='pos_tuple')
+        N = G.number_of_nodes()
+        
+        pos_dict = nx.get_node_attributes(G, 'pos_tuple')
+        pos_arr = np.array([pos_dict[i] for i in range(N)], dtype=np.float32)
+        pos_arr = pos_arr / np.max(pos_arr) # Normalize to [0,1]
+
+        adj = nx.to_numpy_array(G, weight=None) 
+        adj[adj > 0] = 1.0 
+
+        start = np.random.randint(0, N)
+        goal = np.random.randint(0, N)
+        while start == goal:
+             goal = np.random.randint(0, N)
+             
+        return ProblemInstance(adj, start, goal, True, None, pos=pos_arr)
+
+class RoadmapGraphSampler:
+    def __init__(self, config):
+        self.weighted = True
+        
+    def __call__(self, num_nodes):
+        # Geometric Graph
+        radius = math.sqrt(2 * math.log(num_nodes) / num_nodes)
+        pos = np.random.rand(num_nodes, 2)
+        
+        dist = distance_matrix(pos, pos)
+        adj = np.zeros_like(dist)
+        mask = (dist < radius) & (dist > 0)
+        adj[mask] = dist[mask]
+        
+        G = nx.from_numpy_array(adj)
+        if nx.is_connected(G):
+             final_pos = pos
+        else:
+             largest_cc = max(nx.connected_components(G), key=len)
+             final_G = G.subgraph(largest_cc).copy()
+             final_G = nx.convert_node_labels_to_integers(final_G)
+             # Retry if too small
+             if final_G.number_of_nodes() < num_nodes * 0.5:
+                 return self.__call__(num_nodes)
+             
+             old_indices = list(largest_cc)
+             final_pos = pos[old_indices]
+             adj = nx.to_numpy_array(final_G)
+             
+        N = adj.shape[0]
+        start = np.random.randint(0, N)
+        goal = np.random.randint(0, N)
+        while start == goal: goal = np.random.randint(0, N)
+
+        return ProblemInstance(adj, start, goal, True, None, pos=final_pos)
+
+
+# -----------------------------------------------------------------------------
+# 4. CONFIG & SPECS
+# -----------------------------------------------------------------------------
 
 MASK = 0
 NODE_POINTER = 1
@@ -436,25 +684,44 @@ SPEC["dfs"] = (
 )
 SPEC["mst"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
 SPEC["dijkstra"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
-SPEC["mis"] = ((MASK, MASK, MASK, MASK), (NODE_POINTER,))  # MASK
+SPEC["mis"] = ((MASK, MASK, MASK, MASK), (NODE_POINTER,))
+# A*: in_open, in_closed, is_goal (3 node masks) -> Pred, Self-loop (2 edge pointers/masks)
+SPEC["a_star"] = ((MASK, MASK, MASK), (NODE_POINTER, NODE_POINTER))
 
-ALGORITHMS = {"bfs": bfs, "dfs": dfs, "mst": mst, "dijkstra": dijkstra, "mis": mis}
-
+ALGORITHMS = {
+    "bfs": bfs, 
+    "dfs": dfs, 
+    "mst": mst, 
+    "dijkstra": dijkstra, 
+    "mis": mis,
+    "a_star": a_star
+}
 
 def create_dataloader(config: base_config.Config, split: str, seed: int, device):
     np.random.seed(seed)
-
     datapoints = []
-    sampler = ErdosRenyiGraphSampler(config)
+    
+    # Choose Sampler
+    graph_type = getattr(config, 'graph_type', 'er')
+    if graph_type == 'grid':
+        sampler = GridGraphSampler(config)
+    elif graph_type == 'roadmap':
+        sampler = RoadmapGraphSampler(config)
+    elif graph_type == 'geometric':
+        sampler = GeometricGraphSampler(config)
+    else:
+        sampler = ErdosRenyiGraphSampler(config)
 
     for _ in tqdm.tqdm(
         range(config.num_samples[split]), f"Generate samples for {split}"
     ):
         instance = sampler(config.problem_size[split])
+        
         node_fts, edge_fts, scalars = ALGORITHMS[config.algorithm](instance)
 
         edge_index = torch.tensor(instance.edge_index).contiguous()
 
+        # Reshape to (Batch/Time, Nodes, Feats)
         node_fts = torch.transpose(torch.tensor(node_fts), 0, 1)
         edge_fts = torch.transpose(
             torch.tensor(edge_fts)[:, edge_index[0], edge_index[1]], 0, 1
@@ -471,18 +738,128 @@ def create_dataloader(config: base_config.Config, split: str, seed: int, device)
                 scalars=scalars,
                 edge_index=edge_index,
                 y=y,
+                # Pass Planning Inputs Explicitly
+                pos=torch.tensor(instance.pos, dtype=torch.float),
+                goal=torch.tensor(instance.goal)
             ).to(device)
         )
     return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True)
 
+class LazyDataset(Dataset):
+    def __init__(self, config, split, sampler, algorithm):
+        super().__init__()
+        self.config = config
+        self.split = split
+        self.sampler = sampler
+        self.algorithm = algorithm
+        self.num_samples = config.num_samples[split]
+        self.problem_size = config.problem_size[split]
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # 1. Generate Instance on the fly
+        # Note: We ignore 'idx' and just sample random instances.
+        # Determinism is handled by worker_init_fn if needed.
+        instance = self.sampler(self.problem_size)
+        
+        # 2. Run Algorithm
+        node_fts, edge_fts, scalars = self.algorithm(instance)
+
+        # 3. Format Tensors (Same logic as original code)
+        edge_index = torch.tensor(instance.edge_index).contiguous()
+
+        # Transpose to (Time, Nodes, Feats)
+        node_fts = torch.transpose(torch.tensor(node_fts), 0, 1)
+        edge_fts = torch.transpose(
+            torch.tensor(edge_fts)[:, edge_index[0], edge_index[1]], 0, 1
+        )
+        scalars = torch.transpose(torch.tensor(scalars), 0, 1)
+
+        # 4. Define Target
+        output_fts = edge_fts if self.config.output_type == "pointer" else node_fts
+        y = output_fts[:, -1, self.config.output_idx].clone().detach()
+
+        # 5. Return Data Object (CPU)
+        # We generally do not move to GPU inside __getitem__ to allow 
+        # multi-process data loading without CUDA errors.
+        return Data(
+            node_fts=node_fts,
+            edge_fts=edge_fts,
+            scalars=scalars,
+            edge_index=edge_index,
+            y=y,
+            pos=torch.tensor(instance.pos, dtype=torch.float),
+            goal=torch.tensor(instance.goal)
+        )
+
+def create_lazy_dataloader(config, split, seed, device, num_workers=0):
+    np.random.seed(seed)
+    # 1. Setup Sampler based on config
+    graph_type = getattr(config, 'graph_type', 'er')
+    if graph_type == 'grid':
+        sampler = GridGraphSampler(config)
+    elif graph_type == 'roadmap':
+        # Use the Geometric sampler for A*
+        sampler = GeometricGraphSampler(config) 
+    else:
+        sampler = ErdosRenyiGraphSampler(config)
+        
+    algorithm = ALGORITHMS[config.algorithm]
+
+    # 2. Create Dataset
+    dataset = LazyDataset(config, split, sampler, algorithm)
+
+    # 3. Worker Init Function for proper randomness in multi-processing
+    def seed_worker(worker_id):
+        worker_seed = (seed + worker_id) % 2**32
+        np.random.seed(worker_seed)
+
+    # 4. Create DataLoader
+    # We use the standard torch DataLoader with a custom collate function 
+    # to handle PyG Data objects (batching graphs correctly).
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=False, # Shuffling doesn't matter for random generation
+        num_workers=num_workers,
+        worker_init_fn=seed_worker,
+    )
+    
+    return loader
+
 
 if __name__ == "__main__":
-    from configs import base_config
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument(
+        "--config", "-c",
+        type=str,
+        default="configs/mst.yaml",
+        help="Path to the config file.",
+    )
+    argparser.add_argument(
+        "--seed", "-s",
+        type=int,
+        default=42,
+        help="Random seed for data generation.",
+    )
 
-    config = base_config.read_config("configs/mst.yaml")
+    args = argparser.parse_args()
+
+    #check if its a valid config file
+    if not os.path.exists(args.config):
+        raise FileNotFoundError(f"Config file {args.config} not found.")
+    
+
+    config = base_config.read_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    data = create_dataloader(config, "val", seed=1232, device=device)
+    if config.use_lazy_dataset:
+        data = create_lazy_dataloader(config, "val", seed=args.seed, device=device) #remember to put this onto the device later after getting the batch
+    else:
+        data = create_dataloader(config, "val", seed=args.seed, device=device)
+
     for batch in data:
         print(batch.node_fts[:, -1:, 0].sum() / 32)
         break
