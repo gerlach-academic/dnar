@@ -694,7 +694,7 @@ ALGORITHMS = {
     "mst": mst, 
     "dijkstra": dijkstra, 
     "mis": mis,
-    "a_star": a_star
+    "a_star": a_star #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges 
 }
 
 def create_dataloader(config: base_config.Config, split: str, seed: int, device):
