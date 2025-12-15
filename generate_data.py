@@ -246,9 +246,7 @@ def dijkstra(instance: ProblemInstance):
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    # NO INFINITY: Initialize with 0.0 (acting as garbage/unknown).
-    # We rely on 'in_queue' to tell the network that these 0s are not valid yet.
-    node_dist = np.zeros(n, dtype=np.float32)
+    node_dist = np.zeros(n, dtype=np.float32) #changed from position to zero, as was not informative anyways
 
     def compute_current_scalars(dist_vals):
         # Edge features = Weights. Self-loops = Distance Estimates.
