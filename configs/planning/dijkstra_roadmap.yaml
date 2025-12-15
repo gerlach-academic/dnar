@@ -1,0 +1,21 @@
+algorithm: dijkstra
+graph_type: roadmap
+
+# --- data ---
+num_samples:
+  train: 10000
+  val: 320
+  test: 320
+
+problem_size:
+  train: 16
+  val: 16
+  test: 64
+
+edge_weights: true
+
+# --- model ---
+# Dijkstra has 2 node states: in_queue, in_tree
+num_node_states: 2
+# Dijkstra has 2 edge states: pointers, self_loops
+num_edge_states: 2

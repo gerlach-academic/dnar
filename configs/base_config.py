@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import yaml
 
@@ -6,6 +7,8 @@ import yaml
 @dataclass
 class Config:
     algorithm: str = None
+    graph_type: Optional[str] = None
+    use_lazy_dataset: bool = False
 
     # --- train ---
     batch_size: int = 32

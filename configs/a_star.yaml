@@ -1,0 +1,20 @@
+algorithm: a_star
+
+# --- data ---
+num_samples:
+  train: 10000
+  val: 320
+  test: 320
+
+problem_size:
+  train: 16
+  val: 16
+  test: 64
+
+edge_weights: true
+
+# --- model ---
+# A* has 3 node states: in_open, in_closed, is_goal
+num_node_states: 3
+# A* has 2 edge states: pointers, self_loops
+num_edge_states: 2
