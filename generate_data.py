@@ -494,7 +494,7 @@ class ErdosRenyiGraphSampler:
             adj = np.triu(np.random.binomial(1, p, size=(num_nodes, num_nodes)), k=1)
             adj += adj.T
 
-            if self.weighted:
+            if self.weighted: #weights only in [0,1] but because of hard coded relaxation any difference is ok, even 1e-6 between to possible edges, as can still be checked correctly
                 w = np.triu(np.random.uniform(0.0, 1.0, (num_nodes, num_nodes)), k=1)
                 w *= adj
                 adj = w + w.T
@@ -674,6 +674,7 @@ NODE_POINTER = 1
 EDGE_MASK_ONE = 2
 NODE_MASK_ONE = 3
 
+#THE TYPES OF HINTS TO PREDICT: (NODE_HINTS, EDGE_HINTS)=(NODE_MASKS, EDGE_MASKS/POINTERS)
 SPEC = {}
 SPEC["bfs"] = ((MASK,), (NODE_POINTER, NODE_POINTER))
 SPEC["dfs"] = (
@@ -687,13 +688,34 @@ SPEC["mis"] = ((MASK, MASK, MASK, MASK), (NODE_POINTER,))
 SPEC["a_star"] = ((MASK, MASK, MASK), (NODE_POINTER, NODE_POINTER))
 
 ALGORITHMS = {
-    "bfs": bfs, 
-    "dfs": dfs, 
-    "mst": mst, 
-    "dijkstra": dijkstra, 
-    "mis": mis,
+    "bfs": bfs, #==breadth first search
+    "dfs": dfs, #==depth first search
+    "mst": mst, #==PRIM as that is the algorithm used
+    "dijkstra": dijkstra, #==SP as that is the algorithm used
+    "mis": mis, #==maximum independent set
     "a_star": a_star #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges 
 }
+
+def _pad_features(tensor: torch.Tensor, target_features: int) -> torch.Tensor:
+    """
+    Pad the feature dimension (last dim) of a tensor with zeros to reach target_features.
+    
+    Args:
+        tensor: Shape (time, nodes/edges, current_features)
+        target_features: Desired number of features
+    
+    Returns:
+        Tensor with shape (time, nodes/edges, target_features)
+    """
+    current_features = tensor.shape[-1]
+    if current_features >= target_features:
+        return tensor
+    
+    # Create padding: zeros for additional features
+    pad_size = target_features - current_features
+    padding = torch.zeros(*tensor.shape[:-1], pad_size, dtype=tensor.dtype)
+    return torch.cat([tensor, padding], dim=-1)
+
 
 def create_dataloader(config: base_config.Config, split: str, seed: int, device):
     np.random.seed(seed)
@@ -725,6 +747,12 @@ def create_dataloader(config: base_config.Config, split: str, seed: int, device)
             torch.tensor(edge_fts)[:, edge_index[0], edge_index[1]], 0, 1
         )
         scalars = torch.transpose(torch.tensor(scalars), 0, 1)
+        
+        # Pad features to expected dimensions (important for multitask training)
+        # This ensures data from algorithms with fewer states can work with
+        # models configured for max_node_states/max_edge_states
+        node_fts = _pad_features(node_fts, config.num_node_states)
+        edge_fts = _pad_features(edge_fts, config.num_edge_states)
 
         output_fts = edge_fts if config.output_type == "pointer" else node_fts
         y = output_fts[:, -1, config.output_idx].clone().detach()

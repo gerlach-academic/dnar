@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 import yaml
 
@@ -16,10 +16,10 @@ class Config:
     weight_decay: float = 0.0
     num_iterations: int = 1000
     eval_each: int = 250
-    stepwise_training: bool = True
-    processor_upper_t: float = 3.
-    processor_lower_t: float = 0.01
-    use_noise: bool = True
+    stepwise_training: bool = True #whether to use teacher forcing
+    processor_upper_t: float = 3. #gumbel annealing temperature start
+    processor_lower_t: float = 0.01 #gumbel annealing temperature end
+    use_noise: bool = True #whether to use gumbel noise in the softmaxes
 
     # --- data ---
     num_samples: dict = None
@@ -36,6 +36,15 @@ class Config:
 
     output_type: str = 'pointer'
     output_idx: int = 0
+    
+    # --- multitask ---
+    # Number of algorithms for multitask learning. Set > 1 to enable.
+    # When enabled, the model creates separate encoder/decoder components
+    # for each algorithm while sharing the latent processor.
+    multitask_num_algorithms: Optional[int] = None
+    # List of algorithm names for multitask (optional, for documentation)
+    # you may also just call the model.forward with algorithm names directly.
+    multitask_algorithms: Optional[List[str]] = None
 
     # --- logs, io ---
     models_directory: str = 'models'
