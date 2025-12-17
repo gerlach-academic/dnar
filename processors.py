@@ -119,7 +119,8 @@ class AttentionModule(torch.nn.Module):
         sender_s = node_scalars[batch.edge_index[0]]
         reciever_s = node_scalars[batch.edge_index[1]]
 
-        #relaxation that are giganticly helpful inductive biases for easier inference
+        #relaxation that are gigantically helpful inductive biases for easier inference
+        #TODO: remove the relaxation and run thrice with bfs/dijkstra and see if the model can learn without the following features:
         rlx = scalars < reciever_s
         rlx_d = sender_s + scalars < reciever_s
 
