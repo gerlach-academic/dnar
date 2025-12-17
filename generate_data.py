@@ -471,6 +471,180 @@ def a_star(instance: ProblemInstance):
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 
+def eccentricity(instance: ProblemInstance):
+    """
+    Compute the eccentricity of the source node using a flood-echo algorithm.
+    
+    Eccentricity is the maximum shortest path distance from the source to any other node.
+    This implementation follows SALSA-CLRS exactly:
+    - Flood phase: BFS from source, building a tree and propagating distances
+    - Echo phase: Leaves propagate their max distance back up the tree to source
+    
+    Node states (matching SALSA-CLRS hints):
+        - visited: 1 if node has been visited during flood phase
+        - msg_phase: 1 if node is in echo phase (propagating max distance back)
+        - flood_state: distance from source (received during flood)
+        - echo_state: max distance seen (propagated during echo)
+        - leaf: 1 if node is a leaf (has sent echo message)
+        
+    Edge states:
+        - tree: tree edges built during flood phase
+        - self_loops: self-loop markers
+        
+    Scalars:
+        - eccentricity estimate (echo_state at source) on self-loops
+    """
+    n = instance.adj.shape[0]
+    A = instance.adj  # Adjacency matrix
+    source = instance.start
+    
+    node_states = []
+    edge_states = []
+    scalars = []
+    
+    # Node states (matching SALSA-CLRS)
+    flood_state = np.zeros(n, dtype=np.int32)
+    echo_state = np.zeros(n, dtype=np.int32)
+    msg_phase = np.zeros(n, dtype=np.int32)  # 0 = flood, 1 = echo
+    tree = np.zeros((n, n), dtype=np.int32)  # tree[parent, child] = 1
+    visited = np.zeros(n, dtype=np.int32)
+    node_is_leaf = np.zeros(n, dtype=np.int32)
+    
+    # For edge states representation
+    self_loops = np.eye(n, dtype=np.int32)
+    
+    def tree_to_pointers():
+        """Convert tree[parent, child] to pointer representation for edge_states."""
+        # Each node points to its parent (or self if root/unvisited)
+        pointers = np.eye(n, dtype=np.int32)
+        for child in range(n):
+            for parent in range(n):
+                if tree[parent, child]:
+                    pointers[child] = np.zeros(n, dtype=np.int32)
+                    pointers[child][parent] = 1
+                    break
+        return pointers
+    
+    def compute_current_scalars():
+        # Self-loops get the current eccentricity estimate (echo_state at source)
+        s = np.zeros(len(instance.edge_index[0]), dtype=np.float32)
+        for i, (src, dst) in enumerate(zip(instance.edge_index[0], instance.edge_index[1])):
+            if src == dst:
+                s[i] = echo_state[source]
+        return s
+    
+    def send_flood_msg(node, msg, messages, next_tree):
+        """Send flood message to unvisited neighbors, returns True if node is a leaf."""
+        is_leaf = True
+        for neighbor in range(n):
+            if A[node, neighbor] and not visited[neighbor]:
+                messages[neighbor] = max(msg, messages[neighbor])
+                next_tree[node, neighbor] = 1
+                is_leaf = False
+        return is_leaf
+    
+    def send_echo_msg(node, msg, next_echo_state, next_tree, next_msg_phase):
+        """Send echo message back to parent."""
+        for neighbor in range(n):
+            if tree[neighbor, node] and visited[neighbor]:
+                next_echo_state[neighbor] = max(msg, next_echo_state[neighbor])
+                next_tree[neighbor, node] = 0  # Remove tree edge after echo
+                next_msg_phase[neighbor] = 1  # Parent enters echo phase
+    
+    # Initial state
+    push_states(
+        node_states, edge_states, scalars,
+        (visited, msg_phase), (tree_to_pointers(), self_loops),
+        (compute_current_scalars(),),
+    )
+    
+    done = False
+    while not done:
+        next_visited = visited.copy()
+        next_msg_phase = msg_phase.copy()
+        next_tree = tree.copy()
+        messages = np.zeros(n, dtype=np.int32)
+        next_echo_state = echo_state.copy()
+        
+        for node in range(n):
+            if not msg_phase[node]:
+                is_leaf = False
+                
+                # Flood start from source
+                if node == source and not visited[node]:
+                    next_visited[node] = 1
+                    is_leaf = send_flood_msg(node, 1, messages, next_tree)
+                
+                # Flood propagation
+                if flood_state[node] > 0 and not visited[node]:
+                    next_visited[node] = 1
+                    is_leaf = send_flood_msg(node, flood_state[node] + 1, messages, next_tree)
+                
+                # If leaf, switch to echo phase
+                if is_leaf:
+                    node_is_leaf[node] = 1
+                    next_echo_state[node] = flood_state[node]
+                    next_msg_phase[node] = 1
+                    send_echo_msg(node, flood_state[node], next_echo_state, next_tree, next_msg_phase)
+            else:
+                if node_is_leaf[node]:
+                    continue
+                    
+                # Echo phase: check if all children have echoed back
+                is_leaf = True
+                for neighbor in range(n):
+                    # Check if there's still an outgoing tree edge (child hasn't echoed)
+                    if tree[node, neighbor] and not (tree[neighbor, node] and tree[node, neighbor]):
+                        is_leaf = False
+                
+                if is_leaf:
+                    if node == source:
+                        done = True
+                        break
+                    node_is_leaf[node] = 1
+                    # Send echo back to parent
+                    send_echo_msg(node, echo_state[node], next_echo_state, next_tree, next_msg_phase)
+        
+        visited = next_visited
+        msg_phase = next_msg_phase
+        tree = next_tree
+        
+        # Receive flood messages
+        for node in range(n):
+            if messages[node] > 0:
+                if not visited[node]:
+                    flood_state[node] = messages[node]
+                else:
+                    # Node already visited but received message - check if now a leaf
+                    is_leaf = True
+                    for neighbor in range(n):
+                        if tree[node, neighbor] and not (tree[neighbor, node] and tree[node, neighbor]):
+                            is_leaf = False
+                    if is_leaf:
+                        node_is_leaf[node] = 1
+                        next_echo_state[node] = flood_state[node]
+                        next_msg_phase[node] = 1
+                        send_echo_msg(node, flood_state[node], next_echo_state, next_tree, next_msg_phase)
+        
+        echo_state = next_echo_state
+        
+        push_states(
+            node_states, edge_states, scalars,
+            (visited, msg_phase), (tree_to_pointers(), self_loops),
+            (compute_current_scalars(),),
+        )
+    
+    # Pad to n steps
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (visited, msg_phase), (tree_to_pointers(), self_loops),
+            (compute_current_scalars(),),
+        )
+    
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
+
+
 # -----------------------------------------------------------------------------
 # 3. SAMPLERS
 # -----------------------------------------------------------------------------
@@ -686,6 +860,8 @@ SPEC["dijkstra"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
 SPEC["mis"] = ((MASK, MASK, MASK, MASK), (NODE_POINTER,))
 # A*: in_open, in_closed, is_goal (3 node masks) -> Pred, Self-loop (2 edge pointers/masks)
 SPEC["a_star"] = ((MASK, MASK, MASK), (NODE_POINTER, NODE_POINTER))
+# Eccentricity: visited, msg_phase (2 node masks) -> tree pointers, self-loops (2 edge pointers)
+SPEC["eccentricity"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
 
 ALGORITHMS = {
     "bfs": bfs, #==breadth first search
@@ -693,7 +869,8 @@ ALGORITHMS = {
     "mst": mst, #==PRIM as that is the algorithm used
     "dijkstra": dijkstra, #==SP as that is the algorithm used
     "mis": mis, #==maximum independent set
-    "a_star": a_star #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges 
+    "a_star": a_star, #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges 
+    "eccentricity": eccentricity, #==eccentricity of source node (max shorttest distance to reach any other node)
 }
 
 def _pad_features(tensor: torch.Tensor, target_features: int) -> torch.Tensor:

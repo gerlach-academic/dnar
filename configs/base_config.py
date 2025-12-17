@@ -30,6 +30,7 @@ class Config:
     # --- model ---
     h: int = 128
     temp_on_eval: float = 0.
+    checkpoint_interval: float = 0.1 # Fraction of total steps between checkpoints
 
     num_node_states: int = 1
     num_edge_states: int = 1
@@ -49,6 +50,9 @@ class Config:
     # --- logs, io ---
     models_directory: str = 'models'
     tensorboard_logs: bool = True
+    wandb_logs: bool = True
+    wandb_project: str = 'dnar'
+    wandb_entity: Optional[str] = None  # Your wandb username or team name
 
 
 def read_config(config_path: str):

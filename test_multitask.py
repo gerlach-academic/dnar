@@ -30,7 +30,7 @@ def test_multitask_backprop():
     )
     
     # Create model with multitask enabled
-    model = Dnar(config, multitask_num_algorithms=3)
+    model = Dnar(config, multitask_num_algorithms=3) # type: ignore
     
     # Print multitask info
     info = model.get_multitask_info()

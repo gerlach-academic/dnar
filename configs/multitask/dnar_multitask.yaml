@@ -1,0 +1,56 @@
+# Multitask DNAR Configuration
+# This single config enables training on multiple algorithms simultaneously.
+# The model shares the latent processor while using algorithm-specific encoders/decoders.
+
+# List of algorithms to train on. Available: bfs, dfs, mst, dijkstra, mis, a_star
+# The correct num_node_states and num_edge_states are automatically determined from each algorithm's SPEC.
+multitask_algorithms:
+  - bfs
+  - dfs
+  - dijkstra
+  - mis
+  - mst
+  - eccentricity
+
+
+# Graph settings
+graph_type: er  # Erdos-Renyi random graphs
+
+# Training hyperparameters
+batch_size: 32
+learning_rate: 0.0001
+weight_decay: 0.0
+num_iterations: 10000  # Steps PER algorithm (total = num_iterations * num_algorithms)
+eval_each: 500
+stepwise_training: true
+processor_upper_t: 3.0
+processor_lower_t: 0.01
+use_noise: true
+
+# Data settings
+num_samples:
+  train: 1000
+  val: 100
+  test: 100
+problem_size:
+  train: 16
+  val: 16
+  test: 16
+edge_weights: false
+generate_random_numbers: false
+
+# Model architecture
+h: 128
+temp_on_eval: 0.0
+checkpoint_interval: 0.1  # Save checkpoints every 10% of training
+
+# Output settings (for pointer-based algorithms like BFS, Dijkstra)
+output_type: pointer
+output_idx: 0
+
+# Logging
+models_directory: models
+tensorboard_logs: true
+wandb_logs: true  # Set to true to enable Weights & Biases logging
+wandb_project: dnar_multitask  # W&B project name
+# wandb_entity: your_username  # Uncomment and set your W&B username/team
