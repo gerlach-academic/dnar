@@ -1,7 +1,8 @@
 import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import itertools
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -10,7 +11,86 @@ from torch.utils.tensorboard import SummaryWriter
 import models
 import utils
 from configs import base_config
-from generate_data import create_dataloader
+from generate_data import create_dataloader, SPEC
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+
+class DualLogger:
+    """
+    A logger that writes to both TensorBoard and Weights & Biases.
+    Provides the same interface as SummaryWriter.
+    """
+    def __init__(self, tb_writer: Optional[SummaryWriter] = None, use_wandb: bool = False):
+        self.tb_writer = tb_writer
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
+        
+    def add_scalar(self, tag: str, scalar_value, global_step: int):
+        """Log a scalar value to both TensorBoard and wandb."""
+        if self.tb_writer is not None:
+            self.tb_writer.add_scalar(tag, scalar_value, global_step)
+        
+        if self.use_wandb:
+            # Convert TensorBoard-style tag (with /) to wandb-style
+            wandb.log({tag: scalar_value, "step": global_step}, step=global_step)
+    
+    def close(self):
+        """Close the loggers."""
+        if self.tb_writer is not None:
+            self.tb_writer.close()
+        if self.use_wandb:
+            wandb.finish()
+
+
+def create_logger(config: base_config.Config, run_name: str) -> Optional[DualLogger]:
+    """
+    Create a DualLogger based on config settings.
+    
+    Args:
+        config: Configuration with tensorboard_logs and wandb_logs flags
+        run_name: Name for the run (used in both TB and wandb)
+    
+    Returns:
+        DualLogger instance or None if no logging enabled
+    """
+    tb_writer = None
+    use_wandb = False
+    
+    if config.tensorboard_logs:
+        tb_writer = SummaryWriter(comment=f"-{run_name}")
+    
+    if config.wandb_logs:
+        if not WANDB_AVAILABLE:
+            print("Warning: wandb_logs=True but wandb is not installed. Run: pip install wandb")
+        else:
+            # Initialize wandb
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                name=run_name,
+                config={
+                    "algorithm": config.algorithm,
+                    "batch_size": config.batch_size,
+                    "learning_rate": config.learning_rate,
+                    "weight_decay": config.weight_decay,
+                    "num_iterations": config.num_iterations,
+                    "h": config.h,
+                    "num_node_states": config.num_node_states,
+                    "num_edge_states": config.num_edge_states,
+                    "stepwise_training": config.stepwise_training,
+                    "multitask_algorithms": config.multitask_algorithms,
+                }
+            )
+            use_wandb = True
+    
+    if tb_writer is None and not use_wandb:
+        return None
+    
+    return DualLogger(tb_writer, use_wandb)
 
 
 def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, steps, algorithm=None):
@@ -57,9 +137,7 @@ def train(config: base_config.Config, seed):
     val_data = create_dataloader(config, "val", seed=seed + 1, device=device)
     test_data = create_dataloader(config, "test", seed=seed + 2, device=device)
 
-    writer = None
-    if config.tensorboard_logs:
-        writer = SummaryWriter(comment=f"-{model_name}")
+    writer = create_logger(config, model_name)
 
     model.train()
 
@@ -89,8 +167,76 @@ def train(config: base_config.Config, seed):
 
             if steps >= config.num_iterations:
                 break
+    
+    if writer is not None:
+        writer.close()
+    
     model.eval()
     return model
+
+
+def configs_from_multitask_config(config: base_config.Config) -> List[base_config.Config]:
+    """
+    Create per-algorithm configs from a single multitask config.
+    
+    When a config has multitask_algorithms set (e.g., ["bfs", "dijkstra", "dfs"]),
+    this function creates a separate config for each algorithm with the correct
+    num_node_states and num_edge_states based on the algorithm's SPEC.
+    
+    Args:
+        config: A config with multitask_algorithms list set
+        
+    Returns:
+        List of configs, one per algorithm
+    """
+    if not config.multitask_algorithms:
+        raise ValueError("Config must have multitask_algorithms set")
+    
+    configs = []
+    for algorithm in config.multitask_algorithms:
+        if algorithm not in SPEC:
+            raise ValueError(f"Unknown algorithm '{algorithm}'. Available: {list(SPEC.keys())}")
+        
+        # Get state counts from SPEC
+        spec = SPEC[algorithm]
+        num_node_states = len(spec[0])  # First tuple is node states
+        num_edge_states = len(spec[1])  # Second tuple is edge states
+        
+        # Create a copy with algorithm-specific settings
+        algo_config = base_config.Config(
+            algorithm=algorithm,
+            graph_type=config.graph_type,
+            use_lazy_dataset=config.use_lazy_dataset,
+            batch_size=config.batch_size,
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+            num_iterations=config.num_iterations,
+            eval_each=config.eval_each,
+            stepwise_training=config.stepwise_training,
+            processor_upper_t=config.processor_upper_t,
+            processor_lower_t=config.processor_lower_t,
+            use_noise=config.use_noise,
+            num_samples=config.num_samples,
+            problem_size=config.problem_size,
+            edge_weights=config.edge_weights,
+            generate_random_numbers=config.generate_random_numbers,
+            h=config.h,
+            temp_on_eval=config.temp_on_eval,
+            checkpoint_interval=config.checkpoint_interval,
+            num_node_states=num_node_states,
+            num_edge_states=num_edge_states,
+            output_type=config.output_type,
+            output_idx=config.output_idx,
+            models_directory=config.models_directory,
+            tensorboard_logs=config.tensorboard_logs,
+            wandb_logs=config.wandb_logs,
+            wandb_project=config.wandb_project,
+            wandb_entity=config.wandb_entity,
+        )
+        configs.append(algo_config)
+    
+    return configs
+
 
 def train_multitask(configs: List[base_config.Config], seed: int):
     """
@@ -143,12 +289,16 @@ def train_multitask(configs: List[base_config.Config], seed: int):
         generate_random_numbers=configs[0].generate_random_numbers,
         h=configs[0].h,
         temp_on_eval=configs[0].temp_on_eval,
+        checkpoint_interval=configs[0].checkpoint_interval,
         num_node_states=max_node_states,
         num_edge_states=max_edge_states,
         output_type=configs[0].output_type,
         output_idx=configs[0].output_idx,
         models_directory=configs[0].models_directory,
         tensorboard_logs=configs[0].tensorboard_logs,
+        wandb_logs=getattr(configs[0], 'wandb_logs', False),
+        wandb_project=getattr(configs[0], 'wandb_project', 'dnar'),
+        wandb_entity=getattr(configs[0], 'wandb_entity', None),
         multitask_num_algorithms=len(configs),
         multitask_algorithms=algorithms,
     )
@@ -184,9 +334,7 @@ def train_multitask(configs: List[base_config.Config], seed: int):
         val_dataloaders[cfg.algorithm] = create_dataloader(cfg, "val", seed=seed + 1, device=device)
         test_dataloaders[cfg.algorithm] = create_dataloader(cfg, "test", seed=seed + 2, device=device)
 
-    writer = None
-    if unified_config.tensorboard_logs:
-        writer = SummaryWriter(comment=f"-{model_name}")
+    writer = create_logger(unified_config, model_name)
 
     model.train()
     
@@ -202,7 +350,7 @@ def train_multitask(configs: List[base_config.Config], seed: int):
     steps = 0
     
     # Checkpoint intervals for detailed evaluation (10%, 20%, ..., 100%)
-    checkpoint_interval = total_steps // 10
+    checkpoint_interval = total_steps // config.checkpoint_interval
     next_checkpoint = checkpoint_interval
     checkpoint_dir = Path(unified_config.models_directory) / f"checkpoints_{model_name}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -266,7 +414,7 @@ def train_multitask(configs: List[base_config.Config], seed: int):
                 print(f"  Last: {algorithm}, Loss: {loss.item():.4f}")
             
             # Checkpoint evaluation (every 10% of training)
-            if steps >= next_checkpoint:
+            if checkpoint_interval and steps > next_checkpoint: # not the final one here.
                 progress_pct = int(100 * steps / total_steps)
                 print(f"\n{'='*60}")
                 print(f"Checkpoint at {progress_pct}% ({steps}/{total_steps} steps)")
@@ -435,10 +583,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, default="./configs/bfs.yaml",
-                        help="Path to config file (single-task) or comma-separated paths (multitask)")
+                        help="Path to config file. For multitask, can be: "
+                             "1) A single config with 'multitask_algorithms' list, or "
+                             "2) Comma-separated paths to multiple config files")
     parser.add_argument("--num_seeds", type=int, default=3)
     parser.add_argument("--multitask", action="store_true",
-                        help="Enable multitask training with multiple config files")
+                        help="Enable multitask training")
 
     options = parser.parse_args()
 
@@ -447,10 +597,23 @@ if __name__ == "__main__":
         torch.manual_seed(seed)
 
         if options.multitask:
-            # Multitask mode: expect comma-separated config paths
-            config_paths = [p.strip() for p in options.config_path.split(",")]
-            configs = [base_config.read_config(path) for path in config_paths]
-            print(f"Multitask training with configs: {config_paths}")
+            # Check if it's a single config with multitask_algorithms or multiple configs
+            if "," in options.config_path:
+                # Multiple config files (comma-separated)
+                config_paths = [p.strip() for p in options.config_path.split(",")]
+                configs = [base_config.read_config(path) for path in config_paths]
+                print(f"Multitask training with {len(configs)} separate config files")
+            else:
+                # Single config with multitask_algorithms list
+                base_cfg = base_config.read_config(options.config_path)
+                if not base_cfg.multitask_algorithms:
+                    raise ValueError(
+                        "For multitask training with a single config, "
+                        "'multitask_algorithms' must be set (e.g., ['bfs', 'dijkstra', 'dfs'])"
+                    )
+                configs = configs_from_multitask_config(base_cfg)
+                print(f"Multitask training from single config: {base_cfg.multitask_algorithms}")
+            
             model = train_multitask(configs, seed)
         else:
             # Single-task mode

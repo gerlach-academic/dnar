@@ -14,6 +14,7 @@ class Dnar(Module):
     
     When instantiated with multitask_num_algorithms > 1, this model supports
     algorithm-specific encoders/decoders while sharing the latent processor.
+    See the multitask decorator for details.
     
     Usage:
         # Single-task mode
