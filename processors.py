@@ -10,6 +10,7 @@ from generate_data import EDGE_MASK_ONE, MASK, NODE_MASK_ONE, NODE_POINTER, SPEC
 from utils import from_binary_states, gumbel_softmax, node_pointer_loss, temp_by_step
 
 
+
 class StatesEncoder(torch.nn.Module):
     def __init__(self, h, num_binary_states):
         super().__init__()
@@ -27,15 +28,19 @@ class SelectBest(torch.nn.Module):
 
     def forward(self, binary_states, scalars, index):
         states = 2 * from_binary_states(binary_states)
-        group_with_reciever = torch.cat(
+        group_with_reciever = torch.cat( #just a stacking of the states & (batch/edge) index
             [torch.unsqueeze(states, -1), torch.unsqueeze(index, -1)], dim=1
-        )
-        _, group_index = torch.unique(
+        ) # shape [n_nodes, n_indexes(=2)], each combination is a group
+        _, group_index = torch.unique( #finds the unique groups based on the combined state, throws away the batch index, returns the unique group index per node
             group_with_reciever, sorted=False, return_inverse=True, dim=0
         )
 
-        best_in_group = gumbel_softmax(
-            -scalars.squeeze(), group_index, tau=0.0, use_noise=False
+        #1 for best value inside the group, 0 else
+        best_in_group = gumbel_softmax( #dunno why it uses gumbel softmax here, not just argmax    
+            -scalars.squeeze(), #chooses the minimum scalar
+            group_index, 
+            tau=0.0, 
+            use_noise=False
         )
 
         state_with_best = states + best_in_group
@@ -114,6 +119,7 @@ class AttentionModule(torch.nn.Module):
         sender_s = node_scalars[batch.edge_index[0]]
         reciever_s = node_scalars[batch.edge_index[1]]
 
+        #relaxation that are giganticly helpful inductive biases for easier inference
         rlx = scalars < reciever_s
         rlx_d = sender_s + scalars < reciever_s
 
@@ -140,7 +146,6 @@ class AttentionModule(torch.nn.Module):
         edge_V = self.edge_value(combined)
 
         return edge_K, edge_V
-
 
 class ScalarUpdater(torch.nn.Module):
     def __init__(self, config: base_config.Config):
@@ -275,7 +280,9 @@ class StatesBottleneck(torch.nn.Module):
 
         loss = 0.0
 
-        for group in range(2):
+
+        #could probably be optimized for vector operations by having a group and projection dimension
+        for group in range(2):# group=0: node, group=1: edge
             fts = node_fts if group == 0 else edge_fts
             stacked_fts = []
 
@@ -286,9 +293,9 @@ class StatesBottleneck(torch.nn.Module):
                 else batch.edge_fts[:, processor_step]
             )
 
-            for idx, projection in enumerate(projections):
+            for idx, projection in enumerate(projections): # projections not a large matrix but n*[hx1] layers
                 logits = projection(fts).squeeze()
-                gt = hints[:, idx].double()
+                gt = hints[:, idx].double() #select the hint to be projected into
 
                 # loss
                 if training_step != -1:
@@ -306,7 +313,7 @@ class StatesBottleneck(torch.nn.Module):
                     loss += ce_loss
 
                 # postprocess
-                if not teacher_force:
+                if not teacher_force: #if not forced, we use the model's own predictions for the next step
                     if self.spec[group][idx] != MASK:
                         index = batch.batch if group == 0 else batch.edge_index[0]
                         if self.spec[group][idx] == EDGE_MASK_ONE:
@@ -346,16 +353,16 @@ class DiscreteProcessor(torch.nn.Module):
         processor_step,
         teacher_force,
     ):
-        node_fts, edge_fts = self.message_passing(
+        node_fts, edge_fts = self.message_passing( #also has the encoder inside it
             node_states, edge_states, scalars, batch, training_step
         )
         node_fts, edge_fts = self.ffn(node_fts, edge_fts, batch)
 
-        node_states, edge_states, states_loss = self.states_bottleneck(
+        node_states, edge_states, states_loss = self.states_bottleneck( #has part of the decoder inside it
             node_fts, edge_fts, batch, training_step, processor_step, teacher_force
         )
-        out_scalars, scalars_loss = self.scalar_update(
-            node_states,
+        out_scalars, scalars_loss = self.scalar_update( #has part of the decoder inside it
+            node_states, #we use the discretized states for the update to be more consistent
             edge_states,
             scalars,
             batch,

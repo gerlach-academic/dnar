@@ -1,17 +1,37 @@
 import json
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-
+from typing import Dict, Optional
 import numpy as np
 import torch
 from torch_geometric.utils import group_argsort, scatter, softmax
 
 
-def reverse_edge_index(edge_index):
-    rev_edge_index = torch.stack([edge_index[1], edge_index[0]])
-    rev_index = torch.argsort(rev_edge_index, stable=True)[0]
-    assert torch.all(edge_index[:, rev_index] == rev_edge_index)
+# def reverse_edge_index(edge_index): #dunno how this was supposed to work lol 
+#     rev_edge_index = torch.stack([edge_index[1], edge_index[0]])
+#     rev_index = torch.argsort(rev_edge_index, stable=True)[0]
+#     assert torch.all(edge_index[:, rev_index] == rev_edge_index)
+#     return rev_index
+
+def reverse_edge_index(edge_index): #now we actually inverse and keep track of
+    src, dst = edge_index
+    n = edge_index.size(1)
+
+    # map (u,v) -> list of indices
+    edge_map = defaultdict(deque)
+    for i in range(n):
+        edge_map[(src[i].item(), dst[i].item())].append(i)
+
+    rev_index = torch.empty(n, dtype=torch.long)
+
+    for i in range(n):
+        u = dst[i].item()
+        v = src[i].item()
+        rev_index[i] = edge_map[(u, v)].popleft()
+
+    # correctness check
+    assert torch.all(edge_index[:, rev_index] == edge_index.flip(0))
     return rev_index
 
 
@@ -100,8 +120,51 @@ def evaluate(model, dataloader, calculators):
 
     return scores
 
+
+def evaluate_multitask(model, dataloader, calculators, algorithm: str):
+    """
+    Evaluate a multitask model with a specific algorithm context.
+    
+    This ensures the correct algorithm-specific encoders/decoders are used
+    during evaluation.
+    
+    Args:
+        model: The multitask model
+        dataloader: DataLoader for evaluation data
+        calculators: Tuple of metric functions
+        algorithm: Algorithm name to use for evaluation
+    
+    Returns:
+        Dictionary of metric scores
+    """
+    scores = defaultdict(float)
+    total_points = 0
+    for data in dataloader:
+        # Pass the algorithm to use correct encoder/decoder components
+        batched_prediction, _ = model(data, multitask_algorithm=algorithm)
+        for batch_idx, graph in enumerate(data.to_data_list()):
+            batch_pred_idx = (
+                data.batch[data.edge_index[0]]
+                if model.output_type == "pointer"
+                else data.batch
+            )
+            prediction = batched_prediction[batch_pred_idx == batch_idx]
+
+            for calculator in calculators:
+                value = calculator(graph, prediction)
+                scores[calculator.__name__] += (
+                    value if isinstance(value, float) else value.item()
+                )
+            total_points += 1
+    for calculator in calculators:
+        scores[calculator.__name__] /= total_points
+
+    return scores
+
 #evaluates but also prints the predicted pointer structure and the true output structure for reference 
-def evaluate_print(model, dataloader, calculators, output_path="evaluation_results.json"):
+def evaluate_print(model, dataloader, calculators, output_path="evaluation_results.json", 
+                   algorithm: Optional[str] = None, step: Optional[int] = None,
+                   split: str = "test"):
     """
     Evaluates the model and saves detailed results including predicted and true pointers.
     
@@ -110,6 +173,9 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
         dataloader: DataLoader with evaluation data
         calculators: Tuple of metric functions to compute
         output_path: Path to save the results JSON file
+        algorithm: Algorithm name for multitask models (None for single-task)
+        step: Current training step (for checkpoint naming)
+        split: Data split name ("train", "val", "test")
     
     Returns:
         Dictionary with aggregate scores
@@ -124,7 +190,11 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
     correct_graphs = 0
     
     for data in dataloader:
-        batched_prediction, _ = model(data)
+        # Support multitask by passing algorithm if provided
+        if algorithm is not None:
+            batched_prediction, _ = model(data, multitask_algorithm=algorithm)
+        else:
+            batched_prediction, _ = model(data)
         
         for batch_idx, graph in enumerate(data.to_data_list()):
             batch_pred_idx = (
@@ -217,6 +287,9 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
     # Build final results
     results = {
         "timestamp": datetime.now().isoformat(),
+        "algorithm": algorithm,
+        "step": step,
+        "split": split,
         "total_graphs": total_points,
         "summary": {
             "accuracy": scores.get("pointer_accuracy", scores.get("node_mask_accuracy", 0.0)),
@@ -238,7 +311,9 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
     
-    print(f"Evaluation results saved to: {output_path}")
+    algo_str = f"[{algorithm}] " if algorithm else ""
+    step_str = f"step {step} " if step else ""
+    print(f"{algo_str}Evaluation results {step_str}saved to: {output_path}")
     print(f"Summary:")
     print(f"  Total graphs: {total_points}")
     print(f"  Accuracy: {results['summary']['accuracy']:.4f}")
@@ -492,3 +567,344 @@ class ModelSaver:
 NODE_POINTER_METRICS = (pointer_accuracy, pointer_accuracy_graph_level)
 NODE_MASK_METRICS = (node_mask_accuracy, node_mask_accuracy_graph_level)
 METRICS = {"pointer": NODE_POINTER_METRICS, "node_mask": NODE_MASK_METRICS}
+
+
+# =============================================================================
+# MULTITASK DECORATOR
+# =============================================================================
+# This decorator enables algorithm-specific encoder/decoder components while
+# sharing the latent space processor. It handles:
+# 1. Encoder side: self.emb embeddings in StatesEncoder, SelectBest
+# 2. Decoder side: node_projections, edge_projections in StatesBottleneck
+# 3. Algorithm spec for loss calculation in StatesBottleneck
+# =============================================================================
+
+from generate_data import SPEC
+from contextlib import contextmanager
+import copy
+
+
+def _find_embedding_modules(module, prefix=""):
+    """
+    Recursively find all modules that have 'emb' as an Embedding attribute.
+    Returns list of (parent_module, attr_name, embedding_module, full_path).
+    """
+    results = []
+    for name, child in module.named_children():
+        full_path = f"{prefix}.{name}" if prefix else name
+        # Check if this child has an 'emb' attribute that is an Embedding
+        if hasattr(child, 'emb') and isinstance(child.emb, torch.nn.Embedding):
+            results.append((child, 'emb', child.emb, full_path))
+        # Recurse into children
+        results.extend(_find_embedding_modules(child, full_path))
+    return results
+
+
+def _find_states_bottleneck(module, prefix=""):
+    """
+    Recursively find StatesBottleneck modules that have projections and spec.
+    Returns list of (module, full_path).
+    """
+    results = []
+    for name, child in module.named_children():
+        full_path = f"{prefix}.{name}" if prefix else name
+        # Check if this is a StatesBottleneck (has node_projections, edge_projections, spec)
+        if (hasattr(child, 'node_projections') and 
+            hasattr(child, 'edge_projections') and 
+            hasattr(child, 'spec')):
+            results.append((child, full_path))
+        # Recurse into children
+        results.extend(_find_states_bottleneck(child, full_path))
+    return results
+
+
+def _clone_embedding(emb: torch.nn.Embedding) -> torch.nn.Embedding:
+    """Create a new Embedding with the same configuration."""
+    new_emb = torch.nn.Embedding(emb.num_embeddings, emb.embedding_dim, 
+                                  padding_idx=emb.padding_idx)
+    # Initialize with same weights (can be changed to random if desired)
+    new_emb.weight.data.copy_(emb.weight.data)
+    return new_emb
+
+
+def _clone_projection_list(proj_list: torch.nn.ModuleList) -> torch.nn.ModuleList:
+    """Clone a ModuleList of Linear layers."""
+    new_list = torch.nn.ModuleList()
+    for proj in proj_list:
+        new_proj = torch.nn.Linear(proj.in_features, proj.out_features, 
+                                    bias=proj.bias is not None)
+        new_proj.weight.data.copy_(proj.weight.data)
+        if proj.bias is not None:
+            new_proj.bias.data.copy_(proj.bias.data)
+        new_list.append(new_proj)
+    return new_list
+
+
+class MultitaskRegistry:
+    """
+    Stores algorithm-specific components and handles runtime swapping.
+    Attached to the decorated module as _multitask_registry.
+    """
+    def __init__(self, num_algorithms: int):
+        self.num_algorithms = num_algorithms
+        self.algorithm_dict: Dict[str, int] = {}  # algorithm_name -> index
+        
+        # Stores: { (parent_module_id, attr_name): ModuleList of algorithm-specific modules }
+        self.embedding_variants: Dict[tuple, torch.nn.ModuleList] = {}
+        
+        # Stores: { bottleneck_module_id: { 'node_proj': ModuleList, 'edge_proj': ModuleList, 'specs': list } }
+        self.bottleneck_variants: Dict[int, dict] = {}
+        
+        # Original modules for restoration
+        self.original_embeddings: Dict[tuple, torch.nn.Module] = {}
+        self.original_bottlenecks: Dict[int, dict] = {}
+    
+    def register_embedding(self, parent: torch.nn.Module, attr_name: str, 
+                          original_emb: torch.nn.Embedding) -> torch.nn.ModuleList:
+        """Register an embedding for multitask and create algorithm variants."""
+        key = (id(parent), attr_name)
+        if key in self.embedding_variants:
+            return self.embedding_variants[key]
+        
+        # Create list: first is the original, rest are clones
+        variants = torch.nn.ModuleList([original_emb])
+        for _ in range(self.num_algorithms - 1):
+            variants.append(_clone_embedding(original_emb))
+        
+        self.embedding_variants[key] = variants
+        self.original_embeddings[key] = original_emb
+        return variants
+    
+    def register_bottleneck(self, bottleneck: torch.nn.Module) -> dict:
+        """Register a StatesBottleneck for multitask."""
+        key = id(bottleneck)
+        if key in self.bottleneck_variants:
+            return self.bottleneck_variants[key]
+        
+        # Create variants for projections
+        node_proj_variants = torch.nn.ModuleList([bottleneck.node_projections])
+        edge_proj_variants = torch.nn.ModuleList([bottleneck.edge_projections])
+        
+        for _ in range(self.num_algorithms - 1):
+            node_proj_variants.append(_clone_projection_list(bottleneck.node_projections))
+            edge_proj_variants.append(_clone_projection_list(bottleneck.edge_projections))
+        
+        # Specs will be set dynamically based on algorithm name
+        variants = {
+            'node_proj': node_proj_variants,
+            'edge_proj': edge_proj_variants,
+            'specs': [bottleneck.spec] * self.num_algorithms,  # Will be updated on register_algorithm
+        }
+        
+        self.bottleneck_variants[key] = variants
+        self.original_bottlenecks[key] = {
+            'node_proj': bottleneck.node_projections,
+            'edge_proj': bottleneck.edge_projections,
+            'spec': bottleneck.spec,
+        }
+        return variants
+    
+    def get_or_register_algorithm(self, algorithm_name: str) -> int:
+        """Get index for algorithm, registering it if new."""
+        if algorithm_name not in self.algorithm_dict:
+            idx = len(self.algorithm_dict)
+            if idx >= self.num_algorithms:
+                raise ValueError(
+                    f"Cannot register algorithm '{algorithm_name}': already at max "
+                    f"({self.num_algorithms}). Registered: {list(self.algorithm_dict.keys())}"
+                )
+            self.algorithm_dict[algorithm_name] = idx
+            
+            # Update specs for bottlenecks - pad with MASK (0) to match projection counts
+            if algorithm_name in SPEC:
+                from generate_data import MASK  # MASK = 0
+                for key, variants in self.bottleneck_variants.items():
+                    original_spec = SPEC[algorithm_name]
+                    
+                    # Get the projection counts from the first variant
+                    # (all variants have the same number of projections)
+                    num_node_proj = len(variants['node_proj'][0])
+                    num_edge_proj = len(variants['edge_proj'][0])
+                    
+                    # Pad the spec to match projection counts
+                    # original_spec = ((node_hints...), (edge_hints...))
+                    node_spec = original_spec[0] + (MASK,) * (num_node_proj - len(original_spec[0]))
+                    edge_spec = original_spec[1] + (MASK,) * (num_edge_proj - len(original_spec[1]))
+                    
+                    variants['specs'][idx] = (node_spec, edge_spec)
+        
+        return self.algorithm_dict[algorithm_name]
+
+
+class MultitaskContext:
+    """
+    Context manager that swaps in algorithm-specific components during forward pass.
+    """
+    def __init__(self, model: torch.nn.Module, algorithm_name: Optional[str]):
+        self.model = model
+        self.algorithm_name = algorithm_name
+        self.registry: Optional[MultitaskRegistry] = getattr(model, '_multitask_registry', None)
+        self.swapped_embeddings: list = []
+        self.swapped_bottlenecks: list = []
+    
+    def __enter__(self):
+        if self.registry is None or self.algorithm_name is None:
+            return self
+        
+        alg_idx = self.registry.get_or_register_algorithm(self.algorithm_name)
+        
+        # Swap embeddings
+        for (parent_id, attr_name), variants in self.registry.embedding_variants.items():
+            # Find the parent module by id
+            for parent, name, emb, path in _find_embedding_modules(self.model):
+                if id(parent) == parent_id and name == attr_name:
+                    original = getattr(parent, attr_name)
+                    setattr(parent, attr_name, variants[alg_idx])
+                    self.swapped_embeddings.append((parent, attr_name, original))
+                    break
+        
+        # Swap bottleneck components
+        for bottleneck_id, variants in self.registry.bottleneck_variants.items():
+            for bottleneck, path in _find_states_bottleneck(self.model):
+                if id(bottleneck) == bottleneck_id:
+                    orig_node = bottleneck.node_projections
+                    orig_edge = bottleneck.edge_projections
+                    orig_spec = bottleneck.spec
+                    
+                    bottleneck.node_projections = variants['node_proj'][alg_idx]
+                    bottleneck.edge_projections = variants['edge_proj'][alg_idx]
+                    bottleneck.spec = variants['specs'][alg_idx]
+                    
+                    self.swapped_bottlenecks.append((
+                        bottleneck, orig_node, orig_edge, orig_spec
+                    ))
+                    break
+        
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Restore embeddings
+        for parent, attr_name, original in self.swapped_embeddings:
+            setattr(parent, attr_name, original)
+        
+        # Restore bottlenecks
+        for bottleneck, orig_node, orig_edge, orig_spec in self.swapped_bottlenecks:
+            bottleneck.node_projections = orig_node
+            bottleneck.edge_projections = orig_edge
+            bottleneck.spec = orig_spec
+        
+        return False
+
+
+def multitask(cls):
+    """
+    Class decorator to add multitask functionality to a model.
+    
+    Usage:
+        @multitask
+        class Dnar(Module):
+            ...
+    
+    Then instantiate with:
+        model = Dnar(config, multitask_num_algorithms=5)
+    
+    And call forward with:
+        output, loss = model(batch, multitask_algorithm="dijkstra")
+    
+    The decorator will automatically:
+    1. Find all self.emb embeddings in submodules and create algorithm-specific copies
+    2. Find StatesBottleneck modules and create algorithm-specific projections
+    3. Swap the correct components based on multitask_algorithm at runtime
+    
+    Backpropagation works correctly because:
+    - All algorithm-specific modules are registered as submodules (in model.parameters())
+    - The computation graph holds references to the actual weight tensors used
+    - Restoring attributes after forward doesn't affect the gradient computation
+    """
+    original_init = cls.__init__
+    original_forward = cls.forward
+
+    def new_init(self, *args, multitask_num_algorithms: Optional[int] = None, **kwargs):
+        # Call original init
+        original_init(self, *args, **kwargs)
+        
+        # If multitask is enabled, set up the registry
+        if multitask_num_algorithms is not None and multitask_num_algorithms > 1:
+            registry = MultitaskRegistry(multitask_num_algorithms)
+            
+            # Find and register all embeddings
+            embedding_modules = _find_embedding_modules(self)
+            for parent, attr_name, emb, path in embedding_modules:
+                variants = registry.register_embedding(parent, attr_name, emb)
+                # Store variants as a proper submodule for parameter tracking
+                safe_name = path.replace('.', '_')
+                setattr(self, f'_multitask_emb_{safe_name}', variants)
+            
+            # Find and register all StatesBottleneck modules
+            bottleneck_modules = _find_states_bottleneck(self)
+            for bottleneck, path in bottleneck_modules:
+                variants = registry.register_bottleneck(bottleneck)
+                safe_name = path.replace('.', '_')
+                setattr(self, f'_multitask_node_proj_{safe_name}', variants['node_proj'])
+                setattr(self, f'_multitask_edge_proj_{safe_name}', variants['edge_proj'])
+            
+            self._multitask_registry = registry
+            self._multitask_enabled = True
+        else:
+            self._multitask_enabled = False
+
+    def new_forward(self, *args, multitask_algorithm: Optional[str] = None, **kwargs):
+        # Check if multitask is expected but not configured
+        if multitask_algorithm is not None and not getattr(self, '_multitask_enabled', False):
+            raise ValueError(
+                f"Received multitask_algorithm='{multitask_algorithm}' but multitask is not enabled. "
+                f"Set multitask_num_algorithms > 1 when creating the model."
+            )
+        
+        # Use context manager to swap components during forward
+        with MultitaskContext(self, multitask_algorithm):
+            return original_forward(self, *args, **kwargs)
+    
+    def get_multitask_info(self):
+        """
+        Get information about the multitask configuration.
+        Useful for debugging and verifying parameter registration.
+        """
+        if not getattr(self, '_multitask_enabled', False):
+            return {"enabled": False}
+        
+        registry = self._multitask_registry
+        
+        # Count parameters per algorithm variant
+        param_counts = {}
+        
+        # Count embedding parameters
+        emb_params = {i: 0 for i in range(registry.num_algorithms)}
+        for key, variants in registry.embedding_variants.items():
+            for i, emb in enumerate(variants):
+                emb_params[i] += sum(p.numel() for p in emb.parameters())
+        
+        # Count projection parameters
+        proj_params = {i: 0 for i in range(registry.num_algorithms)}
+        for key, variants in registry.bottleneck_variants.items():
+            for i in range(registry.num_algorithms):
+                for proj in variants['node_proj'][i]:
+                    proj_params[i] += sum(p.numel() for p in proj.parameters())
+                for proj in variants['edge_proj'][i]:
+                    proj_params[i] += sum(p.numel() for p in proj.parameters())
+        
+        return {
+            "enabled": True,
+            "num_algorithms": registry.num_algorithms,
+            "registered_algorithms": dict(registry.algorithm_dict),
+            "num_embedding_modules": len(registry.embedding_variants),
+            "num_bottleneck_modules": len(registry.bottleneck_variants),
+            "embedding_params_per_algorithm": emb_params,
+            "projection_params_per_algorithm": proj_params,
+            "total_model_params": sum(p.numel() for p in self.parameters()),
+        }
+
+    cls.__init__ = new_init
+    cls.forward = new_forward
+    cls.get_multitask_info = get_multitask_info
+    return cls
