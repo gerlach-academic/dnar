@@ -1,0 +1,17 @@
+algorithm: bfs
+name: bfs_test
+# --- data ---
+num_samples:
+  train: 500
+  val: 50
+  test: 50
+
+problem_size:
+  train: 16
+  val: 16
+  test: 64
+
+
+# --- model ---
+num_node_states: 1
+num_edge_states: 2

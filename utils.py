@@ -2,10 +2,13 @@ import json
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import numpy as np
 import torch
 from torch_geometric.utils import group_argsort, scatter, softmax
+import time
+import os
+import shutil
 
 
 # def reverse_edge_index(edge_index): #dunno how this was supposed to work lol 
@@ -164,7 +167,7 @@ def evaluate_multitask(model, dataloader, calculators, algorithm: str):
 #evaluates but also prints the predicted pointer structure and the true output structure for reference 
 def evaluate_print(model, dataloader, calculators, output_path="evaluation_results.json", 
                    algorithm: Optional[str] = None, step: Optional[int] = None,
-                   split: str = "test"):
+                   split: str = "test", print_results: bool = True):
     """
     Evaluates the model and saves detailed results including predicted and true pointers.
     
@@ -176,6 +179,7 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
         algorithm: Algorithm name for multitask models (None for single-task)
         step: Current training step (for checkpoint naming)
         split: Data split name ("train", "val", "test")
+        print_results: Whether to print summary results to console
     
     Returns:
         Dictionary with aggregate scores
@@ -311,17 +315,18 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
     with open(output_path, "w") as f:
         json.dump(results, f, indent=2)
     
-    algo_str = f"[{algorithm}] " if algorithm else ""
-    step_str = f"step {step} " if step else ""
-    print(f"{algo_str}Evaluation results {step_str}saved to: {output_path}")
-    print(f"Summary:")
-    print(f"  Total graphs: {total_points}")
-    print(f"  Accuracy: {results['summary']['accuracy']:.4f}")
-    print(f"  Graph-level accuracy: {results['summary']['graph_level_accuracy']:.4f}")
-    print(f"  Total pointer mistakes: {total_pointer_mistakes} / {total_pointers}")
-    print(f"  Mistake rate: {results['summary']['mistake_rate']:.4f}")
-    print(f"  Correct graphs: {correct_graphs} / {total_points}")
-    
+    if print_results:
+        algo_str = f"[{algorithm}] " if algorithm else ""
+        step_str = f"step {step} " if step else ""
+        print(f"{algo_str}Evaluation results {step_str}saved to: {output_path}")
+        print(f"Summary:")
+        print(f"  Total graphs: {total_points}")
+        print(f"  Accuracy: {results['summary']['accuracy']:.4f}")
+        print(f"  Graph-level accuracy: {results['summary']['graph_level_accuracy']:.4f}")
+        print(f"  Total pointer mistakes: {total_pointer_mistakes} / {total_pointers}")
+        print(f"  Mistake rate: {results['summary']['mistake_rate']:.4f}")
+        print(f"  Correct graphs: {correct_graphs} / {total_points}")
+        
     return scores
 
 
@@ -543,25 +548,26 @@ correct_filter = lambda g: g["is_correct"]
 low_acc_filter = lambda g: g["metrics"].get("pointer_accuracy", g["metrics"].get("node_mask_accuracy", 1.0)) < 0.8
 n_mistakes_filter = lambda n: lambda g: g["pointer_mistakes"] >= n
 
-class ModelSaver:
-    def __init__(self, models_directory: str, model_name: str):
-        Path(models_directory).mkdir(parents=True, exist_ok=True)
-        model_name = "{}/{}".format(models_directory, model_name)
+#makes too many 
+# class ModelSaver:
+#     def __init__(self, models_directory: str, model_name: str):
+#         Path(models_directory).mkdir(parents=True, exist_ok=True)
+#         model_name = "{}/{}".format(models_directory, model_name)
 
-        self.best_vals = defaultdict(float)
-        self.model_name = model_name
+#         self.best_vals = defaultdict(float)
+#         self.model_name = model_name
 
-    def visit(self, model, metrics_stat):
-        for metric in metrics_stat:
-            if metrics_stat[metric] > self.best_vals[metric]:
-                self.best_vals[metric] = metrics_stat[metric]
-                self.save(model, metric + "_best")
-        self.save(model, "last")
+#     def visit(self, model, metrics_stat):
+#         for metric in metrics_stat:
+#             if metrics_stat[metric] > self.best_vals[metric]:
+#                 self.best_vals[metric] = metrics_stat[metric]
+#                 self.save(model, metric + "_best")
+#         self.save(model, "last")
 
-    def save(self, model, suffix):
-        path = "{}_{}".format(self.model_name, suffix)
-        print("saving model: ", path)
-        torch.save(model.state_dict(), path)
+#     def save(self, model, suffix):
+#         path = "{}_{}.pt".format(self.model_name, suffix)
+#         print("saving model: ", path)
+#         torch.save(model.state_dict(), path)
 
 
 NODE_POINTER_METRICS = (pointer_accuracy, pointer_accuracy_graph_level)
@@ -908,3 +914,214 @@ def multitask(cls):
     cls.forward = new_forward
     cls.get_multitask_info = get_multitask_info
     return cls
+
+"""
+Restart manager for interrupted training jobs.
+
+Handles:
+- Time-limited training sessions (e.g., 25 min on test nodes)
+- Automatic checkpointing and resume
+- Temporary storage for models during training
+- State tracking across restarts
+"""
+class TrainingSession:
+    """Manages training state for restartable sessions."""
+    
+    def __init__(
+        self,
+        config_path: str,
+        seed: int,
+        max_runtime_seconds: int = 1500,  # 25 minutes
+        temp_dir: Optional[str] = None,
+        multitask: bool = False
+    ):
+        self.config_path = config_path
+        self.seed = seed
+        self.max_runtime_seconds = max_runtime_seconds
+        self.multitask = multitask
+        self.start_time = time.time()
+        
+        # Setup temp directory
+        if temp_dir is None:
+            user = os.environ.get('USER', 'default')
+            temp_dir = f"/tmp/{user}/experiments"
+        self.temp_dir = Path(temp_dir)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # State file
+        self.state_file = self.temp_dir / f"training_state_{self._get_session_id()}.json"
+        
+        # Load or initialize state
+        self.state = self._load_state()
+    
+    def _get_session_id(self) -> str:
+        """Generate unique session ID from config and seed."""
+        config_name = Path(self.config_path).stem
+        return f"{config_name}_seed{self.seed}"
+    
+    def _load_state(self) -> Dict[str, Any]:
+        """Load existing state or create new one."""
+        if self.state_file.exists():
+            with open(self.state_file, 'r') as f:
+                state = json.load(f)
+            print(f"Resuming training from step {state.get('current_step', 0)}")
+            return state
+        else:
+            return {
+                "config_path": self.config_path,
+                "seed": self.seed,
+                "multitask": self.multitask,
+                "current_step": 0,
+                "completed": False,
+                "restarts": 0,
+                "total_runtime": 0.0,
+                "last_checkpoint": None,
+            }
+    
+    def save_state(self, current_step: int, checkpoint_path: Optional[str] = None):
+        """Save current training state."""
+        self.state["current_step"] = current_step
+        self.state["restarts"] = self.state.get("restarts", 0)
+        self.state["total_runtime"] = self.state.get("total_runtime", 0.0) + self.elapsed_time()
+        if checkpoint_path:
+            self.state["last_checkpoint"] = checkpoint_path
+        
+        with open(self.state_file, 'w') as f:
+            json.dump(self.state, f, indent=2)
+    
+    def mark_completed(self, final_model_path: Optional[str] = None):
+        """Mark training as completed."""
+        self.state["completed"] = True
+        self.state["total_runtime"] = self.state.get("total_runtime", 0.0) + self.elapsed_time()
+        if final_model_path:
+            self.state["final_model"] = final_model_path
+        
+        with open(self.state_file, 'w') as f:
+            json.dump(self.state, f, indent=2)
+        
+        print(f"Training completed after {self.state['restarts']} restarts")
+        print(f"Total runtime: {self.state['total_runtime']:.1f}s")
+    
+    def elapsed_time(self) -> float:
+        """Get elapsed time since session start."""
+        return time.time() - self.start_time
+    
+    def should_stop(self) -> bool:
+        """Check if we should stop training to avoid timeout."""
+        return self.elapsed_time() >= self.max_runtime_seconds
+    
+    def is_completed(self) -> bool:
+        """Check if training is completed."""
+        return self.state.get("completed", False)
+    
+    def get_resume_step(self) -> int:
+        """Get step to resume from."""
+        return self.state.get("current_step", 0)
+    
+    def get_last_checkpoint(self) -> Optional[str]:
+        """Get path to last checkpoint."""
+        return self.state.get("last_checkpoint")
+    
+    def cleanup(self):
+        """Clean up temporary files after successful completion."""
+        if self.state_file.exists():
+            self.state_file.unlink()
+
+
+class RestartManager:
+    """Manages discovery and restart of incomplete training jobs."""
+    
+    def __init__(self, temp_dir: Optional[str] = None):
+        if temp_dir is None:
+            user = os.environ.get('USER', 'default')
+            temp_dir = f"/tmp/{user}/experiments"
+        self.temp_dir = Path(temp_dir)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    def find_incomplete_jobs(self) -> list[Dict[str, Any]]:
+        """Find all incomplete training jobs."""
+        incomplete = []
+        
+        for state_file in self.temp_dir.glob("training_state_*.json"):
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+            
+            if not state.get("completed", False):
+                incomplete.append(state)
+        
+        return incomplete
+    
+    def get_next_job(self) -> Optional[Dict[str, Any]]:
+        """Get next incomplete job to restart."""
+        jobs = self.find_incomplete_jobs()
+        if not jobs:
+            return None
+        
+        # Sort by current step (resume furthest progress first)
+        jobs.sort(key=lambda x: x.get("current_step", 0), reverse=True)
+        return jobs[0]
+    
+    def list_jobs(self):
+        """Print all incomplete jobs."""
+        jobs = self.find_incomplete_jobs()
+        
+        if not jobs:
+            print("No incomplete training jobs found.")
+            return
+        
+        print(f"\nFound {len(jobs)} incomplete training job(s):")
+        print("-" * 80)
+        for i, job in enumerate(jobs, 1):
+            config = Path(job['config_path']).stem
+            print(f"{i}. {config} (seed {job['seed']})")
+            print(f"   Step: {job['current_step']} | Restarts: {job.get('restarts', 0)} | "
+                  f"Runtime: {job.get('total_runtime', 0.0):.1f}s")
+            if job.get('last_checkpoint'):
+                print(f"   Checkpoint: {job['last_checkpoint']}")
+        print("-" * 80)
+
+
+def get_temp_model_dir(models_directory: str, model_name: str, temp_dir: Optional[str] = None) -> Path:
+    """
+    Get temporary directory for model saving during training.
+    
+    Args:
+        models_directory: Original models directory
+        model_name: Name of the model
+        temp_dir: Optional temp directory (default: /tmp/$USER/experiments)
+    
+    Returns:
+        Path to temporary model directory
+    """
+    if temp_dir is None:
+        user = os.environ.get('USER', 'default')
+        temp_dir = f"/tmp/{user}/experiments"
+    
+    temp_path = Path(temp_dir) / "models" / model_name
+    temp_path.mkdir(parents=True, exist_ok=True)
+    return temp_path
+
+
+def finalize_model(temp_model_path: str, final_model_path: str):
+    """
+    Move model from temp to final location after training completes.
+    
+    Args:
+        temp_model_path: Temporary model path
+        final_model_path: Final destination path
+    """
+    temp_path = Path(temp_model_path)
+    final_path = Path(final_model_path)
+    
+    if not temp_path.exists():
+        print(f"Warning: Temp model not found at {temp_path}")
+        return
+    
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(temp_path, final_path)
+    print(f"Model finalized: {final_path}")
+    
+    # Clean up temp file
+    if temp_path.exists():
+        temp_path.unlink()
+
