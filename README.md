@@ -23,5 +23,26 @@ python train.py --config_path
 python eval.py
 ```
 
+And you may pass multiple seeds which will be trained sequentially:
+```bash
+python train.py --config_path --num_seeds N
+```
+
+For large graphics cards we allow running multiple seeds in parallel:
+```bash
+python train.py --config_path --num_seeds N --parallel --num_workers M
+```
+
+Furthermore you may the flag `multitask` so that a you may specify multiple configs or a multitask config:
+```bash
+python train.py --config_path config1,config2 --num_seeds N --multitask
+```
+or
+```bash
+python train.py --config_path multitask_config --num_seeds N --multitask
+```
+
+For options on how the config affects the runs, please see the base configuration file `base_config.py` and the specific configuration files in the `configs` folder.
+
 ### Hints generation
 You can find hints generation procedures for each algorithm in `generate_data.py`.

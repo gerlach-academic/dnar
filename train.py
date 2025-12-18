@@ -3,9 +3,11 @@ from pathlib import Path
 from typing import List, Optional
 import itertools
 from copy import deepcopy
+import os
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 
 import models
@@ -73,6 +75,7 @@ def create_logger(config: base_config.Config, run_name: str) -> Optional[DualLog
                 entity=config.wandb_entity,
                 name=run_name,
                 config={
+                    "name": config.name if config.name else config.algorithm,
                     "algorithm": config.algorithm,
                     "batch_size": config.batch_size,
                     "learning_rate": config.learning_rate,
@@ -130,7 +133,7 @@ def train(config: base_config.Config, seed):
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
 
-    model_name = "{}_{}".format(config.algorithm, seed)
+    model_name = "{}_{}".format(config.name if config.name else config.algorithm, seed)
     model_saver = utils.ModelSaver(config.models_directory, model_name)
 
     train_data = create_dataloader(config, "train", seed=seed, device=device)
@@ -140,6 +143,17 @@ def train(config: base_config.Config, seed):
     writer = create_logger(config, model_name)
 
     model.train()
+
+    # Checkpoint setup
+    checkpoint_interval = config.num_iterations * config.checkpoint_interval #is a portion
+    next_checkpoint = checkpoint_interval
+    checkpoint_dir = Path(config.out_directory) / f"checkpoints_{model_name}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nStarting training:")
+    print(f"  Algorithm: {config.algorithm}")
+    print(f"  Iterations: {config.num_iterations}")
+    print(f"  Checkpoints saved every {checkpoint_interval} steps to: {checkpoint_dir}")
 
     steps = 0
     while steps <= config.num_iterations:
@@ -164,14 +178,111 @@ def train(config: base_config.Config, seed):
                     writer,
                     steps,
                 )
+            
+            # Progress logging
+            if steps % 100 == 0:
+                print(f"Step {steps}/{config.num_iterations} | Loss: {loss.item():.4f}")
+            
+            # Checkpoint evaluation
+            if checkpoint_interval and steps > next_checkpoint:
+                progress_pct = int(100 * steps / config.num_iterations)
+                print(f"\n{'='*60}")
+                print(f"Checkpoint at {progress_pct}% ({steps}/{config.num_iterations} steps)")
+                print(f"{'='*60}")
+                
+                # Save model checkpoint
+                checkpoint_path = checkpoint_dir / f"model_step_{steps}.pt"
+                torch.save(model.state_dict(), checkpoint_path)
+                print(f"Model saved to: {checkpoint_path}")
+                
+                # Detailed evaluation
+                with torch.no_grad():
+                    model.eval()
+                    
+                    # Validation set
+                    val_output_path = checkpoint_dir / f"eval_val_step_{steps}.json"
+                    utils.evaluate_print(
+                        model, 
+                        val_data, 
+                        utils.METRICS[config.output_type],
+                        output_path=str(val_output_path),
+                        step=steps,
+                        split="val",
+                        print_results=False,
+                    )
+                    
+                    # Test set
+                    test_output_path = checkpoint_dir / f"eval_test_step_{steps}.json"
+                    utils.evaluate_print(
+                        model,
+                        test_data,
+                        utils.METRICS[config.output_type],
+                        output_path=str(test_output_path),
+                        step=steps,
+                        split="test",
+                        print_results=False,
+                    )
+                    model.train()
+                
+                next_checkpoint += checkpoint_interval
+                print(f"{'='*60}\n")
 
             if steps >= config.num_iterations:
                 break
     
+    # Final evaluation
+    print("\n" + "=" * 60)
+    print("Final Evaluation (100%)")
+    print("=" * 60)
+    
+    # Save final model
+    final_model_path = checkpoint_dir / "model_final.pt"
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Final model saved to: {final_model_path}")
+    
+    model.eval()
+    
+    with torch.no_grad():
+        # Quick evaluation for model saver
+        evaluate(
+            model,
+            val_data,
+            test_data,
+            utils.METRICS[config.output_type],
+            model_saver,
+            writer,
+            steps,
+        )
+        
+        # Detailed final evaluation
+        val_output_path = checkpoint_dir / f"eval_val_final.json"
+        utils.evaluate_print(
+            model, 
+            val_data, 
+            utils.METRICS[config.output_type],
+            output_path=str(val_output_path),
+            step=steps,
+            split="val",
+            print_results=False,
+        )
+        
+        test_output_path = checkpoint_dir / f"eval_test_final.json"
+        utils.evaluate_print(
+            model,
+            test_data,
+            utils.METRICS[config.output_type],
+            output_path=str(test_output_path),
+            step=steps,
+            split="test",
+            print_results=False,
+        )
+    
     if writer is not None:
         writer.close()
     
-    model.eval()
+    # Generate summary
+    _save_training_summary_single(checkpoint_dir, config.name if config.name else config.algorithm, steps)
+    
     return model
 
 
@@ -350,9 +461,9 @@ def train_multitask(configs: List[base_config.Config], seed: int):
     steps = 0
     
     # Checkpoint intervals for detailed evaluation (10%, 20%, ..., 100%)
-    checkpoint_interval = total_steps // config.checkpoint_interval
+    checkpoint_interval = total_steps // unified_config.checkpoint_interval
     next_checkpoint = checkpoint_interval
-    checkpoint_dir = Path(unified_config.models_directory) / f"checkpoints_{model_name}"
+    checkpoint_dir = Path(unified_config.out_directory) / f"checkpoints_{model_name}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"\nStarting multitask training:")
@@ -493,7 +604,8 @@ def train_multitask(configs: List[base_config.Config], seed: int):
                 output_path=str(val_output_path),
                 algorithm=algorithm,
                 step=total_steps,
-                split="val"
+                split="val",
+                print_results=False,
             )
             
             test_output_path = checkpoint_dir / f"eval_{algorithm}_test_final.json"
@@ -504,7 +616,8 @@ def train_multitask(configs: List[base_config.Config], seed: int):
                 output_path=str(test_output_path),
                 algorithm=algorithm,
                 step=total_steps,
-                split="test"
+                split="test",
+                print_results=False,
             )
     
     if writer is not None:
@@ -575,9 +688,107 @@ def _save_training_summary(checkpoint_dir: Path, algorithms: List[str], total_st
     print("=" * 80)
 
 
+def _save_training_summary_single(checkpoint_dir: Path, algorithm: str, total_steps: int):
+    """
+    Generate a summary JSON file for single-task training.
+    """
+    import json
+    from datetime import datetime
+    
+    summary = {
+        "timestamp": datetime.now().isoformat(),
+        "algorithm": algorithm,
+        "total_steps": total_steps,
+        "checkpoints": {}
+    }
+    
+    # Collect metrics from all evaluation files
+    for eval_file in sorted(checkpoint_dir.glob("eval_*.json")):
+        try:
+            with open(eval_file, "r") as f:
+                eval_data = json.load(f)
+            
+            # Parse filename: eval_{split}_step_{step}.json or eval_{split}_final.json
+            parts = eval_file.stem.split("_")
+            split = parts[1]
+            step_info = "_".join(parts[2:])  # "step_1000" or "final"
+            
+            key = f"{split}_{step_info}"
+            summary["checkpoints"][key] = {
+                "split": split,
+                "step": eval_data.get("step"),
+                "accuracy": eval_data["summary"]["accuracy"],
+                "graph_level_accuracy": eval_data["summary"]["graph_level_accuracy"],
+                "mistake_rate": eval_data["summary"]["mistake_rate"],
+            }
+        except Exception as e:
+            print(f"Warning: Could not process {eval_file}: {e}")
+    
+    # Save summary
+    summary_path = checkpoint_dir / "training_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"\nTraining summary saved to: {summary_path}")
+    
+    # Print summary table
+    print("\n" + "=" * 80)
+    print("Training Progress Summary")
+    print("=" * 80)
+    print(f"{'Checkpoint':<30} {'Split':<6} {'Accuracy':<10} {'Graph Acc':<10}")
+    print("-" * 80)
+    for key, data in sorted(summary["checkpoints"].items()):
+        print(f"{key:<30} {data['split']:<6} {data['accuracy']:.4f}     {data['graph_level_accuracy']:.4f}")
+    print("=" * 80)
+
+
+# Worker function für paralleles Training
+def train_worker(args):
+    """Worker für paralleles Training eines einzelnen Seeds"""
+    config_path, seed, multitask, gpu_id = args
+    
+    # Set CUDA device für diesen Worker
+    if gpu_id is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    
+    # Set default dtype statt deprecated set_default_tensor_type
+    torch.set_default_dtype(torch.float64)
+    torch.set_num_threads(5)
+    
+    # Set seeds
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    print(f"\n[Seed {seed}] Starting training on GPU {gpu_id}...")
+    
+    if multitask:
+        # Check if it's a single config with multitask_algorithms or multiple configs
+        if "," in config_path:
+            config_paths = [p.strip() for p in config_path.split(",")]
+            configs = [base_config.read_config(path) for path in config_paths]
+        else:
+            base_cfg = base_config.read_config(config_path)
+            if not base_cfg.multitask_algorithms:
+                raise ValueError(
+                    "For multitask training with a single config, "
+                    "'multitask_algorithms' must be set"
+                )
+            configs = configs_from_multitask_config(base_cfg)
+        
+        model = train_multitask(configs, seed)
+    else:
+        config = base_config.read_config(config_path)
+        model = train(config, seed)
+    
+    print(f"[Seed {seed}] Training complete!")
+    return seed
+
 
 if __name__ == "__main__":
-    torch.set_default_tensor_type(torch.DoubleTensor)
+    # WICHTIG: Muss für torch.multiprocessing gesetzt werden
+    mp.set_start_method('spawn', force=True)
+    
+    torch.set_default_dtype(torch.float64)
     torch.set_num_threads(5)
     torch.autograd.set_detect_anomaly(True)
 
@@ -589,34 +800,70 @@ if __name__ == "__main__":
     parser.add_argument("--num_seeds", type=int, default=3)
     parser.add_argument("--multitask", action="store_true",
                         help="Enable multitask training")
+    parser.add_argument("--parallel", action="store_true",
+                        help="Train seeds in parallel")
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="Number of parallel workers (default: num_seeds)")
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated GPU IDs (e.g., '0,1,2'). If not set, uses CUDA_VISIBLE_DEVICES or all GPUs")
 
     options = parser.parse_args()
-
-    for seed in range(40, 40 + options.num_seeds):
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-
-        if options.multitask:
-            # Check if it's a single config with multitask_algorithms or multiple configs
-            if "," in options.config_path:
-                # Multiple config files (comma-separated)
-                config_paths = [p.strip() for p in options.config_path.split(",")]
-                configs = [base_config.read_config(path) for path in config_paths]
-                print(f"Multitask training with {len(configs)} separate config files")
-            else:
-                # Single config with multitask_algorithms list
-                base_cfg = base_config.read_config(options.config_path)
-                if not base_cfg.multitask_algorithms:
-                    raise ValueError(
-                        "For multitask training with a single config, "
-                        "'multitask_algorithms' must be set (e.g., ['bfs', 'dijkstra', 'dfs'])"
-                    )
-                configs = configs_from_multitask_config(base_cfg)
-                print(f"Multitask training from single config: {base_cfg.multitask_algorithms}")
-            
-            model = train_multitask(configs, seed)
+    
+    seeds = list(range(40, 40 + options.num_seeds))
+    
+    if options.parallel:
+        # Bestimme verfügbare GPUs
+        if options.gpus:
+            gpu_ids = [int(x.strip()) for x in options.gpus.split(',')]
+        elif 'CUDA_VISIBLE_DEVICES' in os.environ:
+            gpu_ids = [int(x) for x in os.environ['CUDA_VISIBLE_DEVICES'].split(',') if x]
         else:
-            # Single-task mode
-            print("Train with config {}".format(options.config_path))
-            config = base_config.read_config(options.config_path)
-            model = train(config, seed)
+            gpu_ids = list(range(torch.cuda.device_count()))
+        
+        if not gpu_ids:
+            raise ValueError("No GPUs available for parallel training")
+        
+        num_workers = options.num_workers or len(seeds)
+        print(f"\nParallel training:")
+        print(f"  Workers: {num_workers}")
+        print(f"  Seeds: {seeds}")
+        print(f"  GPUs: {gpu_ids}")
+        
+        # Verteile Seeds auf GPUs (round-robin)
+        worker_args = [
+            (options.config_path, seed, options.multitask, gpu_ids[i % len(gpu_ids)]) 
+            for i, seed in enumerate(seeds)
+        ]
+        
+        # Starte Pool mit spawn context
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=num_workers) as pool:
+            results = pool.map(train_worker, worker_args)
+        
+        print(f"\nAll seeds completed: {results}")
+    else:
+        # Sequentielles Training (Original)
+        for seed in seeds:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+            if options.multitask:
+                if "," in options.config_path:
+                    config_paths = [p.strip() for p in options.config_path.split(",")]
+                    configs = [base_config.read_config(path) for path in config_paths]
+                    print(f"Multitask training with {len(configs)} separate config files")
+                else:
+                    base_cfg = base_config.read_config(options.config_path)
+                    if not base_cfg.multitask_algorithms:
+                        raise ValueError(
+                            "For multitask training with a single config, "
+                            "'multitask_algorithms' must be set"
+                        )
+                    configs = configs_from_multitask_config(base_cfg)
+                    print(f"Multitask training from single config: {base_cfg.multitask_algorithms}")
+                
+                model = train_multitask(configs, seed)
+            else:
+                print("Train with config {}".format(options.config_path))
+                config = base_config.read_config(options.config_path)
+                model = train(config, seed)
