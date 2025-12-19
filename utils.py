@@ -1074,11 +1074,16 @@ class RestartManager:
         
         return incomplete
     
-    def get_next_job(self) -> Optional[Dict[str, Any]]:
+    def get_next_job(self, filter:str=None) -> Optional[Dict[str, Any]]:
         """Get next incomplete job to restart."""
         jobs = self.find_incomplete_jobs()
         if not jobs:
             return None
+        
+        if filter:#filer is the config path
+            for job in jobs:
+                print(f"'{job['config_path']}'", type(job['config_path']))
+            jobs = [job for job in jobs if filter in job['config_path']]
         
         # Sort by current step (resume furthest progress first)
         jobs.sort(key=lambda x: x.get("current_step", 0), reverse=True)
@@ -1092,8 +1097,10 @@ class RestartManager:
             # If job was restarted in the last 60 seconds, skip it
             # (another process is likely working on it)
             last_restart_time = job.get('last_restart_time', 0)
-            if current_time - last_restart_time > 1800: #don't choose probably running jobs
+            if current_time - last_restart_time > 1200: #don't choose probably running jobs
                 available_jobs.append(job)
+            else:
+                print(f"Skipping job '{job['config_path']}' (recently restarted)")
         
         return available_jobs[0] if available_jobs else None
 
@@ -1337,7 +1344,7 @@ def get_least_used_gpus() -> list[int]:
         
         # Sort by score (lowest first)
         gpu_stats.sort(key=lambda x: x[1])
-        sorted_gpus = [gpu_id for gpu_id, _, _, _ in gpu_stats]
+        sorted_gpus = [gpu_id for gpu_id, score, _, _ in gpu_stats if score < 1e4]  # Filter out very high usage GPUs
         
         print(f"GPU usage (sorted by availability):")
         for gpu_id, score, mem_used, gpu_util in gpu_stats:

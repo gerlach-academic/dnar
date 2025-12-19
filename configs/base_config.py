@@ -16,7 +16,8 @@ class Config:
     learning_rate: float = 0.0001
     weight_decay: float = 0.0
     num_iterations: int = 10000
-    eval_each: int = 50
+    min_iterations: int = 2000 #do at least this before checking early stopping
+    eval_each: int = 100 #eval and for early stopping
     stepwise_training: bool = True #whether to use teacher forcing
     processor_upper_t: float = 3. #gumbel annealing temperature start
     processor_lower_t: float = 0.01 #gumbel annealing temperature end
@@ -32,7 +33,7 @@ class Config:
     # --- model ---
     h: int = 128
     temp_on_eval: float = 0.
-    checkpoint_interval: float = 0.1 # Fraction of total steps between checkpoints
+    checkpoint_interval: float = 0.1 # Fraction of total steps between checkpoints and print evals
 
     num_node_states: int = 1
     num_edge_states: int = 1
