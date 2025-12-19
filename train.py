@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
-from typing import List, Optional
+from time import time
+from typing import List, Optional, Any
 import itertools
 from copy import deepcopy
 import os
@@ -35,16 +36,51 @@ class DualLogger:
 
     def add_scalar(self, tag: str, scalar_value, global_step: int):
         """Log a scalar value to both TensorBoard and wandb."""
+
         if self.tb_writer is not None:
-            self.tb_writer.add_scalar(tag, scalar_value, global_step)
+            if isinstance(scalar_value, dict):
+                for k, v in scalar_value.items():
+                    self.tb_writer.add_scalar(f"{tag}/{k}", v, global_step)
+            else:   
+                self.tb_writer.add_scalar(tag, scalar_value, global_step)
 
         if self.use_wandb:
-            # Log through the explicit run object to avoid global-run ambiguity.
+            # Note: This might increment the internal step if called repeatedly.
+            # Use log_dict for atomic multi-metric logging.
             try:
-                self.wandb_writer.log({tag: scalar_value}, step=global_step)
+                if isinstance(scalar_value, dict):
+                    log_dict = {f"{tag}/{k}": v for k, v in scalar_value.items()}
+                    self.wandb_writer.log(log_dict, step=global_step)
+                else:
+                    self.wandb_writer.log({tag: scalar_value}, step=global_step)
             except Exception as e:
-                # Fail-safe: don't crash training if wandb has issues.
                 print(f"Warning: wandb log failed for {tag}: {e}")
+
+    def log_dict(self, metrics: dict[str, Any], step: int):
+        """
+        Log a dictionary of metrics to a specific step atomically.
+        This ensures all metrics appear at the same x-axis point in WandB.
+        """
+        if self.tb_writer is not None:
+            for tag, value in metrics.items():
+                if isinstance(value, dict):
+                    for k, v in value.items():
+                        self.tb_writer.add_scalar(f"{tag}/{k}", v, step)
+                else:
+                    self.tb_writer.add_scalar(tag, value, step)
+        if self.use_wandb:
+            try:
+                #unify the double dict case
+                log_dict = {}
+                for tag, value in metrics.items():
+                    if isinstance(value, dict):
+                        for k, v in value.items():
+                            log_dict[f"{tag}/{k}"] = v
+                    else:
+                        log_dict[tag] = value
+                self.wandb_writer.log(log_dict, step=step)
+            except Exception as e:
+                print(f"Warning: wandb log_dict failed: {e}")
 
     def close(self):
         """Close the loggers."""
@@ -55,14 +91,12 @@ class DualLogger:
                 pass
         if self.use_wandb and self.wandb_writer is not None:
             try:
-                # Only finish if this run is actually active in this process
                 if getattr(self.wandb_writer, "finish", None) is not None:
                     self.wandb_writer.finish()
             except Exception as e:
                 print(f"Warning: wandb finish failed: {e}")
 
-
-def create_logger(config: base_config.Config, run_name: str) -> Optional[DualLogger]:
+def create_logger(config: base_config.Config, run_name: str, wandb_run_id: Optional[str]) -> Optional[DualLogger]:
     """
     Create a DualLogger based on config settings.
     
@@ -85,7 +119,7 @@ def create_logger(config: base_config.Config, run_name: str) -> Optional[DualLog
             print("Warning: wandb_logs=True but wandb is not installed. Run: pip install wandb")
         else:
             # Reuse existing run if present and matches our id, otherwise init new run.
-            run_id = f"{run_name}"
+            run_id = wandb_run_id if wandb_run_id is not None else f"{run_name}_{int(time())}"
             try:
                 if wandb.run is not None and getattr(wandb.run, "id", None) == run_id:
                     wandb_writer = wandb.run
@@ -134,7 +168,6 @@ def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, step
     with torch.no_grad():
         model.eval()
         if algorithm:
-            # For multitask, we need to evaluate with the correct algorithm context
             val_scores = utils.evaluate_multitask(model, val_data, metrics_list, algorithm)
             test_scores = utils.evaluate_multitask(model, test_data, metrics_list, algorithm)
             print(f"Eval after {steps} steps [{algorithm}]:")
@@ -145,12 +178,17 @@ def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, step
         print("Val scores: ", val_scores)
         print("Test scores: ", test_scores)
         model.train()
+    
+    # If a writer is provided (Single Task), log immediately.
+    # For Multitask, we pass writer=None and handle logging in the loop buffer.
     if writer is not None:
         prefix = f"{algorithm}/" if algorithm else ""
         for stat in val_scores:
             writer.add_scalar(f"{prefix}{stat}/val", val_scores[stat], steps)
             writer.add_scalar(f"{prefix}{stat}/test", test_scores[stat], steps)
     model_saver.visit(model, val_scores)
+
+    return val_scores, test_scores
 
 def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
     device = torch.device(
@@ -175,7 +213,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
     val_data:DataLoader = create_dataloader(config, "val", seed=seed + 1, device=device)
     test_data:DataLoader = create_dataloader(config, "test", seed=seed + 2, device=device)
 
-    writer = create_logger(config, model_name)
+    writer = create_logger(config, model_name, session.get_wandb_run_id() if session else None)
 
     model.train()
 
@@ -560,7 +598,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         val_dataloaders[cfg.algorithm] = create_dataloader(cfg, "val", seed=seed + 1, device=device)
         test_dataloaders[cfg.algorithm] = create_dataloader(cfg, "test", seed=seed + 2, device=device)
 
-    writer = create_logger(unified_config, model_name)
+    writer = create_logger(unified_config, model_name, session.get_wandb_run_id() if session else None)
     model.train()
     
     # Create iterators for interleaved training
@@ -621,6 +659,8 @@ def train_multitask(configs: List[base_config.Config], seed: int,
     training_interrupted = False
     
     while steps < total_steps:
+        round_metrics_buffer = {alg: {} for alg in algorithms}
+
         # Cycle through algorithms - one batch each per round
         for algorithm in algorithms:
             if steps >= total_steps:
@@ -669,21 +709,25 @@ def train_multitask(configs: List[base_config.Config], seed: int,
             opt.step()
             opt.zero_grad()
             
-            # Log loss per algorithm
-            if writer is not None:
-                writer.add_scalar(f"{algorithm}/Loss/train", loss.detach().item(), steps)
+            # buffer loss per algorithm
+            round_metrics_buffer[f"{algorithm}/Loss/train"] = loss.detach().item()
             # Evaluate periodically
             if steps_per_algorithm[algorithm] % unified_config.eval_each == 1:
-                evaluate(
+                val_scores, test_scores = evaluate(
                     model,
                     val_dataloaders[algorithm],
                     test_dataloaders[algorithm],
                     utils.METRICS[unified_config.output_type],
                     model_saver,
-                    writer,
+                    None, #writer is None for multitask as we buffer here
                     steps,
                     algorithm=algorithm,
                 )
+                # Buffer the scores
+                for k, v in val_scores.items():
+                    round_metrics_buffer[f"{algorithm}/{k}/val"] = v
+                for k, v in test_scores.items():
+                    round_metrics_buffer[f"{algorithm}/{k}/test"] = v
             
             # Progress logging
             if steps % (100 * len(algorithms)) == 0:
@@ -750,6 +794,10 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         #Break if interrupted
         if training_interrupted:
             break
+
+        #write buffered metrics for this round
+        if writer is not None:
+            writer.log_dict(round_metrics_buffer, step=steps_per_algorithm[algorithms[0]])
     
     #Handle interruption
     if training_interrupted:
@@ -946,7 +994,10 @@ def _save_training_summary_single(checkpoint_dir: Path, algorithm: str, total_st
 # Worker function für paralleles Training
 def train_worker(args):
     """Worker für paralleles Training eines einzelnen Seeds"""
-    config_path, seed, multitask, gpu_id, max_runtime_minutes = args
+    options, seed, gpu_id = args
+    config_path = options.config_path
+    multitask = options.multitask
+    max_runtime_minutes = options.max_runtime_minutes
     
     # --- Device setup ---
     torch.cuda.set_device(gpu_id)
