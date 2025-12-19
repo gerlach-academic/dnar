@@ -9,6 +9,7 @@ from torch_geometric.utils import group_argsort, scatter, softmax
 import time
 import os
 import shutil
+from generate_data import MASK
 
 
 # def reverse_edge_index(edge_index): #dunno how this was supposed to work lol 
@@ -78,12 +79,12 @@ def node_pointer_loss(logits, gt, index):
 
 def pointer_accuracy(graph, prediction):
     edge_index = graph.edge_index
-    is_predicted_pointer = 1.0 * (
-        group_argsort(prediction, edge_index[0], descending=True, stable=True) == 0
-    )
-
-    assert is_predicted_pointer.sum() == graph.num_nodes
-    return (graph.y * is_predicted_pointer).sum() / graph.num_nodes
+    #get the true node count based on edge index, padding nodes have no edges
+    is_predicted_pointer = 1.0 * (group_argsort(prediction, edge_index[0], descending=True, stable=True) == 0)
+    # Robust N calculation for padded batches
+    valid_nodes_count = is_predicted_pointer.sum()
+    if valid_nodes_count == 0: valid_nodes_count = graph.num_nodes
+    return (graph.y * is_predicted_pointer).sum() / valid_nodes_count
 
 
 def pointer_accuracy_graph_level(graph, prediction):
@@ -217,6 +218,7 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
             # Extract predicted and true pointers
             edge_index = graph.edge_index
             
+            
             if model.output_type == "pointer":
                 # Get predicted pointer indices (argmax per source node)
                 is_predicted_pointer = (
@@ -238,7 +240,13 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
                 
                 # Count mistakes for this graph
                 graph_mistakes = 0
-                num_nodes = graph.num_nodes
+                #use the self-loop edges to infer num nodes because we may pad the nodes
+
+                if graph.edge_index.numel() > 0:
+                    num_nodes = int(graph.edge_index[0].max().item()) + 1
+                else:
+                    num_nodes = graph.num_nodes # Fallback
+               
                 for node in range(num_nodes):
                     pred_ptr = pred_pointers.get(node, node)  # Default to self
                     true_ptr = true_pointers.get(node, node)
@@ -252,7 +260,9 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
                 if is_correct:
                     correct_graphs += 1
             else:
+                num_nodes = graph.y.shape[0]
                 # For node_mask output type
+                if prediction.shape[0] > num_nodes: prediction = prediction[:num_nodes] #if we have padded nodes, cut them off
                 pred_mask = (prediction > 0.0).cpu().numpy().tolist()
                 true_mask = graph.y.cpu().numpy().tolist()
                 pred_pointers = {"mask": pred_mask}
@@ -658,152 +668,105 @@ class MultitaskRegistry:
     """
     def __init__(self, num_algorithms: int):
         self.num_algorithms = num_algorithms
-        self.algorithm_dict: Dict[str, int] = {}  # algorithm_name -> index
-        
-        # Stores: { (parent_module_id, attr_name): ModuleList of algorithm-specific modules }
+        self.algorithm_dict: Dict[str, int] = {}
         self.embedding_variants: Dict[tuple, torch.nn.ModuleList] = {}
-        
-        # Stores: { bottleneck_module_id: { 'node_proj': ModuleList, 'edge_proj': ModuleList, 'specs': list } }
         self.bottleneck_variants: Dict[int, dict] = {}
-        
-        # Original modules for restoration
-        self.original_embeddings: Dict[tuple, torch.nn.Module] = {}
-        self.original_bottlenecks: Dict[int, dict] = {}
-    
-    def register_embedding(self, parent: torch.nn.Module, attr_name: str, 
-                          original_emb: torch.nn.Embedding) -> torch.nn.ModuleList:
-        """Register an embedding for multitask and create algorithm variants."""
+        # New set to track if specs are padded for an index
+        self.specs_initialized = set()
+
+    def register_embedding(self, parent, attr_name, original_emb):
         key = (id(parent), attr_name)
-        if key in self.embedding_variants:
-            return self.embedding_variants[key]
-        
-        # Create list: first is the original, rest are clones
+        if key in self.embedding_variants: return self.embedding_variants[key]
         variants = torch.nn.ModuleList([original_emb])
-        for _ in range(self.num_algorithms - 1):
-            variants.append(_clone_embedding(original_emb))
-        
+        for _ in range(self.num_algorithms - 1): variants.append(_clone_embedding(original_emb))
         self.embedding_variants[key] = variants
-        self.original_embeddings[key] = original_emb
         return variants
-    
-    def register_bottleneck(self, bottleneck: torch.nn.Module) -> dict:
-        """Register a StatesBottleneck for multitask."""
+
+    def register_bottleneck(self, bottleneck):
         key = id(bottleneck)
-        if key in self.bottleneck_variants:
-            return self.bottleneck_variants[key]
-        
-        # Create variants for projections
-        node_proj_variants = torch.nn.ModuleList([bottleneck.node_projections])
-        edge_proj_variants = torch.nn.ModuleList([bottleneck.edge_projections])
-        
+        if key in self.bottleneck_variants: return self.bottleneck_variants[key]
+        node_proj = torch.nn.ModuleList([bottleneck.node_projections])
+        edge_proj = torch.nn.ModuleList([bottleneck.edge_projections])
         for _ in range(self.num_algorithms - 1):
-            node_proj_variants.append(_clone_projection_list(bottleneck.node_projections))
-            edge_proj_variants.append(_clone_projection_list(bottleneck.edge_projections))
-        
-        # Specs will be set dynamically based on algorithm name
-        variants = {
-            'node_proj': node_proj_variants,
-            'edge_proj': edge_proj_variants,
-            'specs': [bottleneck.spec] * self.num_algorithms,  # Will be updated on register_algorithm
-        }
-        
+            node_proj.append(_clone_projection_list(bottleneck.node_projections))
+            edge_proj.append(_clone_projection_list(bottleneck.edge_projections))
+        variants = {'node_proj': node_proj, 'edge_proj': edge_proj, 'specs': [bottleneck.spec] * self.num_algorithms}
         self.bottleneck_variants[key] = variants
-        self.original_bottlenecks[key] = {
-            'node_proj': bottleneck.node_projections,
-            'edge_proj': bottleneck.edge_projections,
-            'spec': bottleneck.spec,
-        }
         return variants
-    
+
     def get_or_register_algorithm(self, algorithm_name: str) -> int:
-        """Get index for algorithm, registering it if new."""
+        # 1. Resolve Index
         if algorithm_name not in self.algorithm_dict:
             idx = len(self.algorithm_dict)
             if idx >= self.num_algorithms:
-                raise ValueError(
-                    f"Cannot register algorithm '{algorithm_name}': already at max "
-                    f"({self.num_algorithms}). Registered: {list(self.algorithm_dict.keys())}"
-                )
+                raise ValueError(f"Max algorithms ({self.num_algorithms}) reached.")
             self.algorithm_dict[algorithm_name] = idx
-            
-            # Update specs for bottlenecks - pad with MASK (0) to match projection counts
+        else:
+            idx = self.algorithm_dict[algorithm_name]
+        
+        # 2. Update specs if not done for this index (e.g. after restart)
+        # This fixes the IndexError because restored dicts didn't trigger padding logic
+        if idx not in self.specs_initialized:
             if algorithm_name in SPEC:
-                from generate_data import MASK  # MASK = 0
+                original_spec = SPEC[algorithm_name]
                 for key, variants in self.bottleneck_variants.items():
-                    original_spec = SPEC[algorithm_name]
-                    
-                    # Get the projection counts from the first variant
-                    # (all variants have the same number of projections)
+                    # Padding logic
                     num_node_proj = len(variants['node_proj'][0])
                     num_edge_proj = len(variants['edge_proj'][0])
+                    current_node_spec = original_spec[0]
+                    current_edge_spec = original_spec[1]
                     
-                    # Pad the spec to match projection counts
-                    # original_spec = ((node_hints...), (edge_hints...))
-                    node_spec = original_spec[0] + (MASK,) * (num_node_proj - len(original_spec[0]))
-                    edge_spec = original_spec[1] + (MASK,) * (num_edge_proj - len(original_spec[1]))
+                    if len(current_node_spec) < num_node_proj:
+                        current_node_spec += (MASK,) * (num_node_proj - len(current_node_spec))
+                    if len(current_edge_spec) < num_edge_proj:
+                        current_edge_spec += (MASK,) * (num_edge_proj - len(current_edge_spec))
                     
-                    variants['specs'][idx] = (node_spec, edge_spec)
-        
-        return self.algorithm_dict[algorithm_name]
+                    variants['specs'][idx] = (current_node_spec, current_edge_spec)
+            self.specs_initialized.add(idx)
+        return idx
 
 
 class MultitaskContext:
     """
     Context manager that swaps in algorithm-specific components during forward pass.
     """
-    def __init__(self, model: torch.nn.Module, algorithm_name: Optional[str]):
+    def __init__(self, model, algorithm_name):
         self.model = model
         self.algorithm_name = algorithm_name
-        self.registry: Optional[MultitaskRegistry] = getattr(model, '_multitask_registry', None)
-        self.swapped_embeddings: list = []
-        self.swapped_bottlenecks: list = []
-    
+        self.registry = getattr(model, '_multitask_registry', None)
+        self.swapped = []
+
     def __enter__(self):
-        if self.registry is None or self.algorithm_name is None:
-            return self
-        
+        if self.registry is None or self.algorithm_name is None: return self
         alg_idx = self.registry.get_or_register_algorithm(self.algorithm_name)
         
-        # Swap embeddings
-        for (parent_id, attr_name), variants in self.registry.embedding_variants.items():
-            # Find the parent module by id
-            for parent, name, emb, path in _find_embedding_modules(self.model):
-                if id(parent) == parent_id and name == attr_name:
-                    original = getattr(parent, attr_name)
-                    setattr(parent, attr_name, variants[alg_idx])
-                    self.swapped_embeddings.append((parent, attr_name, original))
+        # Swap Embeddings
+        for (pid, attr), variants in self.registry.embedding_variants.items():
+            for parent, name, _, _ in _find_embedding_modules(self.model):
+                if id(parent) == pid and name == attr:
+                    orig = getattr(parent, attr)
+                    setattr(parent, attr, variants[alg_idx])
+                    self.swapped.append((parent, attr, orig))
                     break
         
-        # Swap bottleneck components
-        for bottleneck_id, variants in self.registry.bottleneck_variants.items():
-            for bottleneck, path in _find_states_bottleneck(self.model):
-                if id(bottleneck) == bottleneck_id:
-                    orig_node = bottleneck.node_projections
-                    orig_edge = bottleneck.edge_projections
-                    orig_spec = bottleneck.spec
-                    
-                    bottleneck.node_projections = variants['node_proj'][alg_idx]
-                    bottleneck.edge_projections = variants['edge_proj'][alg_idx]
-                    bottleneck.spec = variants['specs'][alg_idx]
-                    
-                    self.swapped_bottlenecks.append((
-                        bottleneck, orig_node, orig_edge, orig_spec
-                    ))
+        # Swap Bottlenecks
+        for bid, variants in self.registry.bottleneck_variants.items():
+            for btn, _ in _find_states_bottleneck(self.model):
+                if id(btn) == bid:
+                    orig = (btn.node_projections, btn.edge_projections, btn.spec)
+                    btn.node_projections = variants['node_proj'][alg_idx]
+                    btn.edge_projections = variants['edge_proj'][alg_idx]
+                    btn.spec = variants['specs'][alg_idx]
+                    self.swapped.append((btn, "bottleneck", orig))
                     break
-        
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Restore embeddings
-        for parent, attr_name, original in self.swapped_embeddings:
-            setattr(parent, attr_name, original)
-        
-        # Restore bottlenecks
-        for bottleneck, orig_node, orig_edge, orig_spec in self.swapped_bottlenecks:
-            bottleneck.node_projections = orig_node
-            bottleneck.edge_projections = orig_edge
-            bottleneck.spec = orig_spec
-        
+        for obj, attr, orig in self.swapped:
+            if attr == "bottleneck":
+                obj.node_projections, obj.edge_projections, obj.spec = orig
+            else:
+                setattr(obj, attr, orig)
         return False
 
 
@@ -835,34 +798,21 @@ def multitask(cls):
     original_init = cls.__init__
     original_forward = cls.forward
 
-    def new_init(self, *args, multitask_num_algorithms: Optional[int] = None, **kwargs):
-        # Call original init
+    def new_init(self, *args, multitask_num_algorithms=None, **kwargs):
         original_init(self, *args, **kwargs)
-        
-        # If multitask is enabled, set up the registry
-        if multitask_num_algorithms is not None and multitask_num_algorithms > 1:
-            registry = MultitaskRegistry(multitask_num_algorithms)
-            
-            # Find and register all embeddings
-            embedding_modules = _find_embedding_modules(self)
-            for parent, attr_name, emb, path in embedding_modules:
-                variants = registry.register_embedding(parent, attr_name, emb)
-                # Store variants as a proper submodule for parameter tracking
-                safe_name = path.replace('.', '_')
-                setattr(self, f'_multitask_emb_{safe_name}', variants)
-            
-            # Find and register all StatesBottleneck modules
-            bottleneck_modules = _find_states_bottleneck(self)
-            for bottleneck, path in bottleneck_modules:
-                variants = registry.register_bottleneck(bottleneck)
-                safe_name = path.replace('.', '_')
-                setattr(self, f'_multitask_node_proj_{safe_name}', variants['node_proj'])
-                setattr(self, f'_multitask_edge_proj_{safe_name}', variants['edge_proj'])
-            
-            self._multitask_registry = registry
+        if multitask_num_algorithms and multitask_num_algorithms > 1:
+            reg = MultitaskRegistry(multitask_num_algorithms)
+            for p, a, e, path in _find_embedding_modules(self):
+                vars = reg.register_embedding(p, a, e)
+                safe_name = path.replace(".","_")
+                setattr(self, f'_multitask_emb_{safe_name}', vars)
+            for b, path in _find_states_bottleneck(self):
+                vars = reg.register_bottleneck(b)
+                safe_name = path.replace(".","_")
+                setattr(self, f'_multitask_node_proj_{safe_name}', vars['node_proj'])
+                setattr(self, f'_multitask_edge_proj_{safe_name}', vars['edge_proj'])
+            self._multitask_registry = reg
             self._multitask_enabled = True
-        else:
-            self._multitask_enabled = False
 
     def new_forward(self, *args, multitask_algorithm: Optional[str] = None, **kwargs):
         # Check if multitask is expected but not configured
@@ -939,7 +889,8 @@ class TrainingSession:
         max_runtime_seconds: int = 1500,  # 25 minutes
         temp_dir: Optional[str] = None,
         multitask: bool = False,
-        algorithms: Optional[list] = None
+        algorithms: Optional[list] = None,
+        patience: int = 5,
     ):
         self.config_path = config_path
         self.seed = seed
@@ -947,6 +898,7 @@ class TrainingSession:
         self.multitask = multitask
         self.algorithms = algorithms or []
         self.start_time = time.time()
+        self.patience = patience
         
         # Setup temp directory
         if temp_dir is None:
@@ -999,7 +951,31 @@ class TrainingSession:
                 "total_runtime": 0.0,
                 "last_checkpoint": None,
                 "wandb_run_id": wandb_id,  # <--- Persist the unique ID
+                "best_val_score": -1.0,
+                "patience_counter": 0,
             }
+
+    def check_early_stopping(self, current_val_score: float) -> bool:
+        """
+        Updates patience state. Returns True if training should stop.
+        """
+        best_score = self.state.get("best_val_score", -1.0)
+        
+        # Check for improvement (assuming higher is better, like accuracy)
+        # Using a small epsilon 1e-4 to prevent stopping on floating point jitter
+        if current_val_score > (best_score + 1e-4):
+            self.state["best_val_score"] = current_val_score
+            self.state["patience_counter"] = 0
+            print(f"  > New best val score: {current_val_score:.4f}")
+        else:
+            self.state["patience_counter"] = self.state.get("patience_counter", 0) + 1
+            print(f"  > No improvement. Patience: {self.state['patience_counter']}/{self.patience} (Best: {best_score:.4f})")
+        
+        # Save state immediately to persist counter across restarts
+        with open(self.state_file, 'w') as f: 
+            json.dump(self.state, f, indent=2)
+            
+        return self.state["patience_counter"] >= self.patience
 
     def get_wandb_run_id(self) -> str:
         """Get the persistent WandB run ID for this session."""
@@ -1116,10 +1092,35 @@ class RestartManager:
             # If job was restarted in the last 60 seconds, skip it
             # (another process is likely working on it)
             last_restart_time = job.get('last_restart_time', 0)
-            if current_time - last_restart_time > 60:
+            if current_time - last_restart_time > 1800: #don't choose probably running jobs
                 available_jobs.append(job)
         
         return available_jobs[0] if available_jobs else None
+
+    def get_next_jobs(self, num_jobs: int, filter:str=None) -> list[Dict[str, Any]]:
+        """Get up to N incomplete jobs to restart."""
+        jobs = self.find_incomplete_jobs()
+        if not jobs:
+            return []
+
+        if filter:#filer is the config path
+            jobs = [job for job in jobs if filter in job['config_path']]
+        
+        # Sort by current step (resume furthest progress first)
+        jobs.sort(key=lambda x: x.get("current_step", 0), reverse=True)
+        
+        # Filter out jobs that are currently being processed
+        current_time = time.time()
+        available_jobs = []
+        
+        for job in jobs:
+            last_restart_time = job.get('last_restart_time', 0)
+            if current_time - last_restart_time > 1800: #don't choose probably running jobs
+                available_jobs.append(job)
+                if len(available_jobs) >= num_jobs:
+                    break
+        
+        return available_jobs
     
     def list_jobs(self):
         """Print all incomplete jobs."""

@@ -15,7 +15,7 @@ class Config:
     batch_size: int = 32
     learning_rate: float = 0.0001
     weight_decay: float = 0.0
-    num_iterations: int = 1000
+    num_iterations: int = 10000
     eval_each: int = 50
     stepwise_training: bool = True #whether to use teacher forcing
     processor_upper_t: float = 3. #gumbel annealing temperature start
