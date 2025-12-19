@@ -7,6 +7,7 @@ import os
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 
@@ -14,7 +15,7 @@ import models
 import utils
 from configs import base_config
 from generate_data import create_dataloader, SPEC
-from utils import TrainingSession, RestartManager, get_temp_model_dir, finalize_model
+from utils import TrainingSession, RestartManager, get_temp_model_dir, finalize_model, get_least_used_gpus, get_gpus
 
 try:
     import wandb
@@ -26,27 +27,39 @@ except ImportError:
 class DualLogger:
     """
     A logger that writes to both TensorBoard and Weights & Biases.
-    Provides the same interface as SummaryWriter.
     """
-    def __init__(self, tb_writer: Optional[SummaryWriter] = None, use_wandb: bool = False):
+    def __init__(self, tb_writer: Optional[SummaryWriter] = None, wandb_writer: Optional[object] = None):
         self.tb_writer = tb_writer
-        self.use_wandb = use_wandb and WANDB_AVAILABLE
-        
+        self.wandb_writer = wandb_writer
+        self.use_wandb = (wandb_writer is not None) and WANDB_AVAILABLE
+
     def add_scalar(self, tag: str, scalar_value, global_step: int):
         """Log a scalar value to both TensorBoard and wandb."""
         if self.tb_writer is not None:
             self.tb_writer.add_scalar(tag, scalar_value, global_step)
-        
+
         if self.use_wandb:
-            # Convert TensorBoard-style tag (with /) to wandb-style
-            wandb.log({tag: scalar_value, "step": global_step}, step=global_step)
-    
+            # Log through the explicit run object to avoid global-run ambiguity.
+            try:
+                self.wandb_writer.log({tag: scalar_value}, step=global_step)
+            except Exception as e:
+                # Fail-safe: don't crash training if wandb has issues.
+                print(f"Warning: wandb log failed for {tag}: {e}")
+
     def close(self):
         """Close the loggers."""
         if self.tb_writer is not None:
-            self.tb_writer.close()
-        if self.use_wandb:
-            wandb.finish()
+            try:
+                self.tb_writer.close()
+            except Exception:
+                pass
+        if self.use_wandb and self.wandb_writer is not None:
+            try:
+                # Only finish if this run is actually active in this process
+                if getattr(self.wandb_writer, "finish", None) is not None:
+                    self.wandb_writer.finish()
+            except Exception as e:
+                print(f"Warning: wandb finish failed: {e}")
 
 
 def create_logger(config: base_config.Config, run_name: str) -> Optional[DualLogger]:
@@ -61,40 +74,54 @@ def create_logger(config: base_config.Config, run_name: str) -> Optional[DualLog
         DualLogger instance or None if no logging enabled
     """
     tb_writer = None
+    wandb_writer = None
     use_wandb = False
-    
+
     if config.tensorboard_logs:
         tb_writer = SummaryWriter(comment=f"-{run_name}")
-    
+
     if config.wandb_logs:
         if not WANDB_AVAILABLE:
             print("Warning: wandb_logs=True but wandb is not installed. Run: pip install wandb")
         else:
-            # Initialize wandb
-            wandb.init(
-                project=config.wandb_project,
-                entity=config.wandb_entity,
-                name=run_name,
-                config={
-                    "name": config.name if config.name else config.algorithm,
-                    "algorithm": config.algorithm,
-                    "batch_size": config.batch_size,
-                    "learning_rate": config.learning_rate,
-                    "weight_decay": config.weight_decay,
-                    "num_iterations": config.num_iterations,
-                    "h": config.h,
-                    "num_node_states": config.num_node_states,
-                    "num_edge_states": config.num_edge_states,
-                    "stepwise_training": config.stepwise_training,
-                    "multitask_algorithms": config.multitask_algorithms,
-                }
-            )
-            use_wandb = True
-    
+            # Reuse existing run if present and matches our id, otherwise init new run.
+            run_id = f"{run_name}"
+            try:
+                if wandb.run is not None and getattr(wandb.run, "id", None) == run_id:
+                    wandb_writer = wandb.run
+                else:
+                    # Use explicit id + resume to make behavior deterministic across restarts
+                    wandb_writer = wandb.init(
+                        project=config.wandb_project,
+                        entity=config.wandb_entity,
+                        name=run_name,
+                        id=run_id,
+                        resume="allow",
+                        config={
+                            "name": config.name if getattr(config, "name", None) else config.algorithm,
+                            "algorithm": config.algorithm,
+                            "batch_size": config.batch_size,
+                            "learning_rate": config.learning_rate,
+                            "weight_decay": config.weight_decay,
+                            "num_iterations": config.num_iterations,
+                            "h": config.h,
+                            "num_node_states": config.num_node_states,
+                            "num_edge_states": config.num_edge_states,
+                            "stepwise_training": config.stepwise_training,
+                            "multitask_algorithms": getattr(config, "multitask_algorithms", None),
+                        },
+                        # Do NOT use reinit=True here; we control init explicitly.
+                    )
+                use_wandb = True
+            except Exception as e:
+                print(f"Warning: wandb.init() failed: {e}. Continuing without wandb.")
+                wandb_writer = None
+                use_wandb = False
+
     if tb_writer is None and not use_wandb:
         return None
-    
-    return DualLogger(tb_writer, use_wandb)
+
+    return DualLogger(tb_writer, wandb_writer)
 
 
 def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, steps, algorithm=None):
@@ -125,8 +152,12 @@ def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, step
             writer.add_scalar(f"{prefix}{stat}/test", test_scores[stat], steps)
     model_saver.visit(model, val_scores)
 
-def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
+    device = torch.device(
+        (f"cuda:{gpu_id}" if gpu_id else get_gpus(1)[0]) 
+            if torch.cuda.is_available() else "cpu"
+    )
+
     model = models.Dnar(config).to(device)
 
     opt = torch.optim.AdamW(
@@ -140,9 +171,9 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
     model_saver_dir = str(temp_model_dir) if temp_model_dir else config.models_directory
     model_saver = utils.ModelSaver(model_saver_dir, model_name)
 
-    train_data = create_dataloader(config, "train", seed=seed, device=device)
-    val_data = create_dataloader(config, "val", seed=seed + 1, device=device)
-    test_data = create_dataloader(config, "test", seed=seed + 2, device=device)
+    train_data:DataLoader = create_dataloader(config, "train", seed=seed, device=device)
+    val_data:DataLoader = create_dataloader(config, "val", seed=seed + 1, device=device)
+    test_data:DataLoader = create_dataloader(config, "test", seed=seed + 2, device=device)
 
     writer = create_logger(config, model_name)
 
@@ -191,7 +222,6 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
 
     steps = resume_from_step
     training_interrupted = False
-    
     while steps <= config.num_iterations:
         for batch in train_data:
             # Skip batches until we reach resume point (already at resume_from_step)
@@ -213,6 +243,8 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
                 session.save_state(steps, str(checkpoint_path))
                 training_interrupted = True
                 break
+
+            batch = batch.to(device)
 
             _, loss = model(batch, writer, training_step=steps)
             assert not torch.isnan(loss)
@@ -442,11 +474,15 @@ def configs_from_multitask_config(config: base_config.Config) -> List[base_confi
 
 
 def train_multitask(configs: List[base_config.Config], seed: int, 
-                    session: Optional[TrainingSession] = None):
+                    session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
     """
     Multitask training with restart support.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        (f"cuda:{gpu_id}" if gpu_id else get_gpus(1)[0]) 
+        if torch.cuda.is_available() else "cpu"
+    )
+    
     
     # Validate configs
     algorithms = [cfg.algorithm for cfg in configs]
@@ -534,12 +570,12 @@ def train_multitask(configs: List[base_config.Config], seed: int,
     total_steps = unified_config.num_iterations * len(algorithms)
     
     # Checkpoint intervals
-    checkpoint_interval = total_steps // unified_config.checkpoint_interval if unified_config.checkpoint_interval > 0 else 0
+    checkpoint_interval = total_steps * unified_config.checkpoint_interval if unified_config.checkpoint_interval > 0 else 0
     next_checkpoint = checkpoint_interval
     checkpoint_dir = Path(unified_config.out_directory) / f"checkpoints_{model_name}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    # ADDED: Resume from checkpoint if session provided
+    #Resume from checkpoint if session provided
     if session and session.get_resume_step() > 0:
         resume_step = session.get_resume_step()
         steps_per_algorithm = session.get_steps_per_algorithm()
@@ -590,7 +626,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
             if steps >= total_steps:
                 break
             
-            # ADDED: Check timeout
+            #Check timeout
             if session and session.should_stop():
                 print(f"\nReaching time limit, saving checkpoint at step {steps}...")
                 checkpoint_path = checkpoint_dir / f"model_step_{steps}_interrupt.pt"
@@ -617,6 +653,8 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                 train_iterators[algorithm] = iter(train_dataloaders[algorithm])
                 batch = next(train_iterators[algorithm])
             
+            batch = batch.to(device) #if data was cached
+
             steps += 1
             steps_per_algorithm[algorithm] += 1
             
@@ -633,9 +671,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
             
             # Log loss per algorithm
             if writer is not None:
-                writer.add_scalar(f"{algorithm}/Loss/train", loss.detach().item(), steps_per_algorithm[algorithm])
-                writer.add_scalar("Loss/train_combined", loss.detach().item(), steps)
-
+                writer.add_scalar(f"{algorithm}/Loss/train", loss.detach().item(), steps)
             # Evaluate periodically
             if steps_per_algorithm[algorithm] % unified_config.eval_each == 1:
                 evaluate(
@@ -645,7 +681,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                     utils.METRICS[unified_config.output_type],
                     model_saver,
                     writer,
-                    steps_per_algorithm[algorithm],
+                    steps,
                     algorithm=algorithm,
                 )
             
@@ -711,11 +747,11 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                 next_checkpoint += checkpoint_interval
                 print(f"{'='*60}\n")
         
-        # ADDED: Break if interrupted
+        #Break if interrupted
         if training_interrupted:
             break
     
-    # ADDED: Handle interruption
+    #Handle interruption
     if training_interrupted:
         print(f"\nTraining interrupted at step {steps}. Restart with --restart to continue.")
         if writer is not None:
@@ -753,7 +789,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                 utils.METRICS[unified_config.output_type],
                 model_saver,
                 writer,
-                steps_per_algorithm[algorithm],
+                steps,
                 algorithm=algorithm,
             )
             
@@ -786,7 +822,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
     
     _save_training_summary(checkpoint_dir, algorithms, total_steps, steps_per_algorithm)
     
-    # ADDED: Mark session as completed
+    #Mark session as completed
     if session:
         session.mark_completed(str(final_model_path))
         session.cleanup()
@@ -912,60 +948,57 @@ def train_worker(args):
     """Worker für paralleles Training eines einzelnen Seeds"""
     config_path, seed, multitask, gpu_id, max_runtime_minutes = args
     
-    # Set CUDA device für diesen Worker
-    if gpu_id is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    # Set default dtype statt deprecated set_default_tensor_type
-    torch.set_default_dtype(torch.float64)
-    torch.set_num_threads(5)
-    
-    # Set seeds
+    # --- Device setup ---
+    torch.cuda.set_device(gpu_id)
+    device = torch.device(f"cuda:{gpu_id}")
+
+    # --- Reproducibility ---
     np.random.seed(seed)
     torch.manual_seed(seed)
-    
-    # Create training session for restart management
-    session = TrainingSession(
-        config_path, 
-        seed,
-        max_runtime_seconds=max_runtime_minutes * 60,
-        multitask=multitask
-    )
-    
-    print(f"\n[Seed {seed}] Starting training on GPU {gpu_id}...")
-    
+    torch.cuda.manual_seed_all(seed)
+
+    # --- Algorithms (identical to sequential) ---
+    algorithms = []
     if multitask:
-        # Check if it's a single config with multitask_algorithms or multiple configs
         if "," in config_path:
             config_paths = [p.strip() for p in config_path.split(",")]
             configs = [base_config.read_config(path) for path in config_paths]
         else:
             base_cfg = base_config.read_config(config_path)
             if not base_cfg.multitask_algorithms:
-                raise ValueError(
-                    "For multitask training with a single config, "
-                    "'multitask_algorithms' must be set"
-                )
+                raise ValueError("Config must have multitask_algorithms set")
             configs = configs_from_multitask_config(base_cfg)
-        
-        model = train_multitask(configs, seed, session=session)
+
+        algorithms = [cfg.algorithm for cfg in configs]
+
+    # --- Session (identical to sequential) ---
+    session = TrainingSession(
+        config_path,
+        seed,
+        max_runtime_seconds=max_runtime_minutes * 60,
+        multitask=multitask,
+        algorithms=algorithms
+    )
+    session.increment_restart_count()
+
+    # --- Training ---
+    if multitask:
+        model = train_multitask(configs, seed, session=session, gpu_id=gpu_id)
     else:
+        print(f"Train with config {config_path}")
         config = base_config.read_config(config_path)
-        model = train(config, seed, session=session)
-    
-    if model is not None:
-        print(f"[Seed {seed}] Training complete!")
-    else:
-        print(f"[Seed {seed}] Training interrupted - restart required")
-    
-    return seed
+        model = train(config, seed, session=session, gpu_id=gpu_id)
+    return {
+        "seed": seed,
+        "gpu": gpu_id,
+        "status": "done"
+    }
 
 
 if __name__ == "__main__":
     # WICHTIG: Muss für torch.multiprocessing gesetzt werden
     mp.set_start_method('spawn', force=True)
     
-    torch.set_default_dtype(torch.float64)
     torch.set_num_threads(5)
     torch.autograd.set_detect_anomaly(True)
 
@@ -987,6 +1020,10 @@ if __name__ == "__main__":
                         help="Restart incomplete training jobs")
     parser.add_argument("--list_jobs", action="store_true",
                         help="List all incomplete training jobs")
+    parser.add_argument("--clean_jobs", action="store_true",
+                        help="Clean up all incomplete training job state files")
+    parser.add_argument("--clean_job", type=str, default=None,
+                        help="Clean up specific job by session ID (e.g., 'bfs_seed40')")
     parser.add_argument("--max_runtime_minutes", type=int, default=25,
                         help="Maximum runtime per training session in minutes (default: 25)")
 
@@ -996,6 +1033,17 @@ if __name__ == "__main__":
     if options.list_jobs:
         manager = RestartManager()
         manager.list_jobs()
+        exit()
+
+    # Handle job cleaning
+    if options.clean_jobs:
+        manager = RestartManager()
+        manager.clean_all_jobs()
+        exit()
+    
+    if options.clean_job:
+        manager = RestartManager()
+        manager.clean_job(options.clean_job)
         exit()
     
     # Handle restart mode
@@ -1013,7 +1061,7 @@ if __name__ == "__main__":
         print(f"  Current step: {job['current_step']}")
         print(f"  Restarts: {job.get('restarts', 0)}")
         
-        # ADDED: Get algorithms for multitask
+        #Get algorithms for multitask
         algorithms = job.get('algorithms', [])
         
         # Create session and train
@@ -1022,8 +1070,9 @@ if __name__ == "__main__":
             job['seed'],
             max_runtime_seconds=options.max_runtime_minutes * 60,
             multitask=job.get('multitask', False),
-            algorithms=algorithms  # ADDED
+            algorithms=algorithms 
         )
+        session.increment_restart_count()
         
         np.random.seed(job['seed'])
         torch.manual_seed(job['seed'])
@@ -1048,13 +1097,46 @@ if __name__ == "__main__":
     
     seeds = list(range(40, 40 + options.num_seeds))
     
-    if not options.parallel:
+    if options.parallel:
+        # Bestimme verfügbare GPUs
+        if options.gpus:
+            gpu_ids = [int(x.strip()) for x in options.gpus.split(',')]
+        else:
+            try:
+                gpu_ids = get_least_used_gpus()
+            except Exception as e:
+                if 'CUDA_VISIBLE_DEVICES' in os.environ:
+                    gpu_ids = [int(x) for x in os.environ['CUDA_VISIBLE_DEVICES'].split(',') if x]
+                else:
+                    gpu_ids = list(range(torch.cuda.device_count()))
+        
+        if not gpu_ids:
+            raise ValueError("No GPUs available for parallel training")
+        
+        num_workers = min(len(seeds), len(gpu_ids))
+        print("\nParallel training:")
+        print(f"  Workers: {num_workers}")
+        print(f"  Seeds: {seeds}")
+        print(f"  GPUs: {gpu_ids}")
+
+        worker_args = [
+            (options, seed, gpu_ids[i % len(gpu_ids)])
+            for i, seed in enumerate(seeds)
+        ]
+
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=num_workers) as pool:
+            results = pool.map(train_worker, worker_args)
+
+        print(f"\nAll seeds completed: {results}")
+    
+    else:
         # Sequential training
         for seed in seeds:
             np.random.seed(seed)
             torch.manual_seed(seed)
             
-            # ADDED: Get algorithms list for session
+            #Get algorithms list for session
             algorithms = []
             if options.multitask:
                 if "," in options.config_path:
@@ -1073,8 +1155,9 @@ if __name__ == "__main__":
                 seed,
                 max_runtime_seconds=options.max_runtime_minutes * 60,
                 multitask=options.multitask,
-                algorithms=algorithms  # ADDED
+                algorithms=algorithms 
             )
+            session.increment_restart_count()
 
             if options.multitask:
                 model = train_multitask(configs, seed, session=session)

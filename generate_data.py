@@ -4,10 +4,16 @@ import networkx as nx
 import numpy as np
 import torch
 import tqdm
-from torch.utils.data import Dataset
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
+from torch.utils.data import Dataset,DataLoader
+from torch_geometric.data import Data, Batch
 from scipy.spatial import distance_matrix
+import pickle
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Optional, List
+from torch_geometric.loader import DataLoader as GeomDataLoader
 
 from configs import base_config
 import argparse
@@ -932,49 +938,62 @@ class LazyDataset(Dataset):
         self.algorithm = algorithm
         self.num_samples = config.num_samples[split]
         self.problem_size = config.problem_size[split]
+        self.cache = {}
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # 1. Generate Instance on the fly
-        # Note: We ignore 'idx' and just sample random instances.
-        # Determinism is handled by worker_init_fn if needed.
-        instance = self.sampler(self.problem_size)
-        
-        # 2. Run Algorithm
-        node_fts, edge_fts, scalars = self.algorithm(instance)
+        if idx not in self.cache:
+            # 1. Generate instance
+            instance = self.sampler(self.problem_size)
 
-        # 3. Format Tensors (Same logic as original code)
-        edge_index = torch.tensor(instance.edge_index).contiguous()
+            # 2. Run algorithm (NumPy outputs)
+            node_fts, edge_fts, scalars = self.algorithm(instance)
 
-        # Transpose to (Time, Nodes, Feats)
-        node_fts = torch.transpose(torch.tensor(node_fts), 0, 1)
-        edge_fts = torch.transpose(
-            torch.tensor(edge_fts)[:, edge_index[0], edge_index[1]], 0, 1
-        )
-        scalars = torch.transpose(torch.tensor(scalars), 0, 1)
+            # 3. Prepare raw CPU arrays ONLY
+            edge_index = instance.edge_index.astype(np.int64)
 
-        # 4. Define Target
-        output_fts = edge_fts if self.config.output_type == "pointer" else node_fts
-        y = output_fts[:, -1, self.config.output_idx].clone().detach()
+            node_fts = np.transpose(node_fts, (1, 0, 2))  # (T, N, F)
+            edge_fts = np.transpose(
+                edge_fts[:, edge_index[0], edge_index[1]], (1, 0, 2)
+            )
+            scalars = np.transpose(scalars, (1, 0, 2))
 
-        # 5. Return Data Object (CPU)
-        # We generally do not move to GPU inside __getitem__ to allow 
-        # multi-process data loading without CUDA errors.
+            # 4. Pad features (multitask safety)
+            node_fts = _pad_features(torch.from_numpy(node_fts), self.config.num_node_states).numpy()
+            edge_fts = _pad_features(torch.from_numpy(edge_fts), self.config.num_edge_states).numpy()
+
+            output_fts = edge_fts if self.config.output_type == "pointer" else node_fts
+            y = output_fts[:, -1, self.config.output_idx]
+
+            # 5. Cache RAW DATA ONLY
+            self.cache[idx] = {
+                "node_fts": node_fts,
+                "edge_fts": edge_fts,
+                "scalars": scalars,
+                "edge_index": edge_index,
+                "y": y,
+                "pos": instance.pos,
+                "goal": instance.goal,
+            }
+
+        c = self.cache[idx]
+
+        # 6. Rebuild PyG Data (fresh, CPU, safe)
         return Data(
-            node_fts=node_fts,
-            edge_fts=edge_fts,
-            scalars=scalars,
-            edge_index=edge_index,
-            y=y,
-            pos=torch.tensor(instance.pos, dtype=torch.float),
-            goal=torch.tensor(instance.goal)
+            node_fts=torch.tensor(c["node_fts"], dtype=torch.float32),
+            edge_fts=torch.tensor(c["edge_fts"], dtype=torch.float32),
+            scalars=torch.tensor(c["scalars"], dtype=torch.float32),
+            edge_index=torch.tensor(c["edge_index"], dtype=torch.long),
+            y=torch.tensor(c["y"], dtype=torch.long),
+            pos=torch.tensor(c["pos"], dtype=torch.float32),
+            goal=torch.tensor(c["goal"], dtype=torch.long),
         )
 
 def create_lazy_dataloader(config, split, seed, device, num_workers=0):
     np.random.seed(seed)
-    # 1. Setup Sampler based on config
+
     graph_type = getattr(config, 'graph_type', 'er')
     if graph_type == 'grid':
         sampler = GridGraphSampler(config)
@@ -986,41 +1005,30 @@ def create_lazy_dataloader(config, split, seed, device, num_workers=0):
         
     algorithm = ALGORITHMS[config.algorithm]
 
-    # 2. Create Dataset
     dataset = LazyDataset(config, split, sampler, algorithm)
 
-    # 3. Worker Init Function for proper randomness in multi-processing
     def seed_worker(worker_id):
         worker_seed = (seed + worker_id) % 2**32
         np.random.seed(worker_seed)
+        # also seed torch for full determinism in workers
+        torch.manual_seed(worker_seed)
 
-    # 4. Create DataLoader
-    # We use the standard torch DataLoader with a custom collate function 
-    # to handle PyG Data objects (batching graphs correctly).
-    loader = DataLoader(
+    # Use torch.utils.data.DataLoader + collate that builds a PyG Batch
+    loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.batch_size,
-        shuffle=False, # Shuffling doesn't matter for random generation
+        shuffle=False,
         num_workers=num_workers,
         worker_init_fn=seed_worker,
+        collate_fn=pad_and_collate,
     )
+
     
     return loader
 
 
 
 # ---- DATA CACHING ----
-import pickle
-import hashlib
-import json
-import time
-from pathlib import Path
-from typing import Optional, List
-import torch
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
-
-
 def get_dataset_cache_key(config, split: str, seed: int) -> str:
     """
     Generate a unique cache key for a dataset based on config parameters.
@@ -1106,20 +1114,70 @@ def load_dataset_from_cache(cache_path: Path, device, expected_seed: int) -> Opt
             datapoints = cache_data
             print(f"Dataset loaded from cache: {cache_path} (legacy format)")
         
-        # Move to target device
-        datapoints = [data.to(device) for data in datapoints]
-        
+        #not moving to device her, as we handle it in the traning loop
         return datapoints
     except Exception as e:
         print(f"Warning: Failed to load cached dataset: {e}")
         return None
 
 
+def pad_and_collate(batch):
+    """
+    Pads time and node dimensions so PyG can batch variable-sized graph trajectories.
+    Assumes node_fts is (Nodes, Time, Features).
+    """
+    if not batch:
+        return Batch.from_data_list([])
+
+    # Batch shape: (Nodes, Time, Feats)
+    max_N = max(d.node_fts.shape[0] for d in batch)
+    max_T = max(d.node_fts.shape[1] for d in batch)
+
+    padded_list = []
+
+    for d in batch:
+        N, T, F = d.node_fts.shape
+        _, _, EF = d.edge_fts.shape
+        _, _, S_dim = d.scalars.shape
+
+        # ---- pad node_fts: (N, T, F) -> (max_N, max_T, F) ----
+        node_pad = torch.zeros((max_N, max_T, F), dtype=d.node_fts.dtype)
+        node_pad[:N, :T, :] = d.node_fts
+
+        # ---- pad edge_fts: (Edges, T, F) -> (Edges, max_T, F) ----
+        # Note: We do NOT pad the number of edges (dim 0). PyG handles variable edge counts natively.
+        # We only pad the Time dimension.
+        E = d.edge_fts.shape[0]
+        edge_pad = torch.zeros((E, max_T, EF), dtype=d.edge_fts.dtype)
+        edge_pad[:, :T, :] = d.edge_fts
+
+        # ---- pad scalars: (Edges, T, S) -> (Edges, max_T, S) ----
+        scalars_pad = torch.zeros((E, max_T, S_dim), dtype=d.scalars.dtype)
+        scalars_pad[:, :T, :] = d.scalars
+
+        # We set num_nodes=max_N. 
+        # Batch.from_data_list will automatically shift edge_index by accumulating num_nodes.
+        # The padded "dummy" nodes (indices N to max_N-1) will be isolated.
+        padded_list.append(
+            Data(
+                node_fts=node_pad,
+                edge_fts=edge_pad,
+                scalars=scalars_pad,
+                edge_index=d.edge_index,
+                y=d.y,
+                pos=d.pos,
+                goal=d.goal,
+                num_nodes=max_N, 
+            )
+        )
+
+    return Batch.from_data_list(padded_list)
+
 def create_dataloader_with_cache(config, split: str, seed: int, device):
     """
-    Create dataloader with caching support.
+    Create dataloader with caching support. 
     
-    Checks cache first, generates and saves if not found.
+    Checks cache first, generates and saves if not found. Device irrelevant for caching.
     """
     # Check if caching is enabled (default: True)
     use_cache = getattr(config, 'use_dataset_cache', True)
@@ -1131,7 +1189,7 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
         datapoints = load_dataset_from_cache(cache_path, device, expected_seed=seed)
         
         if datapoints is not None:
-            return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True)
+            return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True, collate_fn=pad_and_collate)
     
     # Generate data (original logic)
     np.random.seed(seed)
@@ -1180,14 +1238,19 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
                 y=y,
                 pos=torch.tensor(instance.pos, dtype=torch.float),
                 goal=torch.tensor(instance.goal)
-            ).to(device)
+            )
         )
     
     # Save to cache
     if use_cache:
         save_dataset_to_cache(datapoints, cache_path, seed)
     
-    return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True)
+    return DataLoader(
+        datapoints, 
+        batch_size=config.batch_size, 
+        shuffle=True,
+        collate_fn=pad_and_collate
+    )
 
 def clear_cache(algorithm: Optional[str] = None, graph_type: Optional[str] = None):
     """
@@ -1197,6 +1260,9 @@ def clear_cache(algorithm: Optional[str] = None, graph_type: Optional[str] = Non
         algorithm: If specified, only clear this algorithm's cache
         graph_type: If specified, only clear this graph type's cache
     """
+    #load the config
+    config = base_config.Config()
+
     cache_dir = Path(getattr(config, 'cache_directory', 'data_cache'))
     
     if not cache_dir.exists():
@@ -1324,9 +1390,11 @@ if __name__ == "__main__":
 
     if args.info or (not args.clear):
         get_cache_info()
+        exit()
     
     if args.clear:
         clear_cache(args.algorithm, args.graph_type)
+        exit()
 
     #check if its a valid config file
     if not os.path.exists(args.config):
