@@ -102,7 +102,9 @@ def node_mask_accuracy_graph_level(graph, prediction):
 def evaluate(model, dataloader, calculators):
     scores = defaultdict(float)
     total_points = 0
+    device = model.parameters().__next__().device
     for data in dataloader:
+        data = data.to(device)
         batched_prediction, _ = model(data)
         for batch_idx, graph in enumerate(data.to_data_list()):
             batch_pred_idx = (
@@ -142,7 +144,9 @@ def evaluate_multitask(model, dataloader, calculators, algorithm: str):
     """
     scores = defaultdict(float)
     total_points = 0
+    device = model.parameters().__next__().device
     for data in dataloader:
+        data = data.to(device)
         # Pass the algorithm to use correct encoder/decoder components
         batched_prediction, _ = model(data, multitask_algorithm=algorithm)
         for batch_idx, graph in enumerate(data.to_data_list()):
@@ -193,7 +197,9 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
     total_pointers = 0
     correct_graphs = 0
     
+    device = model.parameters().__next__().device
     for data in dataloader:
+        data = data.to(device)
         # Support multitask by passing algorithm if provided
         if algorithm is not None:
             batched_prediction, _ = model(data, multitask_algorithm=algorithm)
@@ -1045,11 +1051,12 @@ class TrainingSession:
         return self.state.get("last_checkpoint")
     
     def increment_restart_count(self):
-        """Increment restart counter."""
+        """Increment restart counter and record timestamp."""
         self.state["restarts"] = self.state.get("restarts", 0) + 1
+        self.state["last_restart_time"] = time.time()
         with open(self.state_file, 'w') as f:
             json.dump(self.state, f, indent=2)
-    
+        
     def cleanup(self):
         """Clean up temporary files after successful completion."""
         if self.state_file.exists():
@@ -1087,7 +1094,20 @@ class RestartManager:
         
         # Sort by current step (resume furthest progress first)
         jobs.sort(key=lambda x: x.get("current_step", 0), reverse=True)
-        return jobs[0]
+        
+        # Filter out jobs that are currently being processed
+        # (indicated by recent restart timestamp)
+        current_time = time.time()
+        available_jobs = []
+        
+        for job in jobs:
+            # If job was restarted in the last 60 seconds, skip it
+            # (another process is likely working on it)
+            last_restart_time = job.get('last_restart_time', 0)
+            if current_time - last_restart_time > 60:
+                available_jobs.append(job)
+        
+        return available_jobs[0] if available_jobs else None
     
     def list_jobs(self):
         """Print all incomplete jobs."""
@@ -1107,6 +1127,43 @@ class RestartManager:
             if job.get('last_checkpoint'):
                 print(f"   Checkpoint: {job['last_checkpoint']}")
         print("-" * 80)
+    
+    def clean_all_jobs(self) -> int:
+        """Clean up all incomplete training job state files. Returns count of cleaned jobs."""
+        state_files = list(self.temp_dir.glob("training_state_*.json"))
+        
+        if not state_files:
+            return 0
+        
+        print(f"\nCleaning {len(state_files)} job state file(s)...")
+        for state_file in state_files:
+            print(f"  Removing: {state_file.name}")
+            state_file.unlink()
+        
+        return len(state_files)
+    
+    def clean_job(self, session_id: str) -> bool:
+        """Clean up a specific job by session ID."""
+        state_file = self.temp_dir / f"training_state_{session_id}.json"
+        
+        if not state_file.exists():
+            return False
+        
+        print(f"Removing state file: {state_file}")
+        state_file.unlink()
+        return True
+    
+    def _get_session_id_from_job(self, job: Dict[str, Any]) -> str:
+        """Extract session ID from job state."""
+        config_name = Path(job['config_path']).stem
+        seed = job['seed']
+        
+        if job.get('multitask', False):
+            algorithms = job.get('algorithms', [])
+            algo_str = "_".join(sorted(algorithms))
+            return f"{config_name}_multitask_{algo_str}_seed{seed}"
+        
+        return f"{config_name}_seed{seed}"
 
 
 def get_temp_model_dir(models_directory: str, model_name: str, temp_dir: Optional[str] = None) -> Path:
@@ -1217,3 +1274,79 @@ def load_multitask_checkpoint(model, checkpoint_path: str) -> int:
     step = checkpoint.get('step', 0)
     print(f"Checkpoint loaded from step {step}")
     return step
+
+# gpu stuff
+def get_least_used_gpus() -> list[int]:
+    """
+    Get list of GPU IDs sorted by usage (least used first).
+    Falls back to all GPUs if nvidia-smi is not available.
+    """
+    try:
+        import subprocess
+        # Get GPU memory usage using nvidia-smi
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=index,memory.used,utilization.gpu', '--format=csv,noheader,nounits'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode != 0:
+            print("Warning: nvidia-smi failed, using all GPUs")
+            return list(range(torch.cuda.device_count()))
+        
+        # Parse output: index, memory_used_mb, gpu_util_percent
+        gpu_stats = []
+        for line in result.stdout.strip().split('\n'):
+            if line:
+                parts = [p.strip() for p in line.split(',')]
+                try:
+                    gpu_id = int(parts[0])
+                    mem_used = int(parts[1])
+                    
+                    # Handle [N/A] or [Not Supported] for gpu_util
+                    gpu_util_str = parts[2] if len(parts) > 2 else '0'
+                    if '[N/A]' in gpu_util_str or '[Not Supported]' in gpu_util_str or gpu_util_str == '':
+                        gpu_util = 0  # Assume idle if not available
+                    else:
+                        gpu_util = int(gpu_util_str)
+                    
+                    # Combined score: prioritize low memory usage, then low GPU util
+                    score = mem_used * 0.7 + gpu_util * 0.3
+                    gpu_stats.append((gpu_id, score, mem_used, gpu_util))
+                except (ValueError, IndexError) as e:
+                    print(f"Warning: Could not parse GPU line '{line}': {e}")
+                    continue
+        
+        if not gpu_stats:
+            print("Warning: No valid GPU stats parsed, using all GPUs")
+            return list(range(torch.cuda.device_count()))
+        
+        # Sort by score (lowest first)
+        gpu_stats.sort(key=lambda x: x[1])
+        sorted_gpus = [gpu_id for gpu_id, _, _, _ in gpu_stats]
+        
+        print(f"GPU usage (sorted by availability):")
+        for gpu_id, score, mem_used, gpu_util in gpu_stats:
+            util_str = f"{gpu_util}%" if gpu_util > 0 else "N/A"
+            print(f"  GPU {gpu_id}: {mem_used}MB used, {util_str} util, score {score:.1f}")
+        
+        return sorted_gpus
+    
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        print(f"Warning: Could not query GPU stats ({e}), using all GPUs")
+        return list(range(torch.cuda.device_count()))
+
+def get_gpus(int: int) -> list[int]:
+    """
+    Get a list of GPU IDs to use, selecting the least used ones.
+    
+    Args:
+        int: Number of GPUs to select.
+    Returns:
+        List of GPU IDs.
+    """
+    available_gpus = get_least_used_gpus()
+    selected_gpus = available_gpus[:int]
+    print(f"Selected GPUs: {selected_gpus}")
+    return selected_gpus
