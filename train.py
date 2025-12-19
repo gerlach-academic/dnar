@@ -204,9 +204,10 @@ def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, step
 
 def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
     device = torch.device(
-        (f"cuda:{gpu_id}" if gpu_id else get_gpus(1)[0]) 
+        (f"cuda:{gpu_id}" if gpu_id is not None else get_gpus(1)[0]) 
             if torch.cuda.is_available() else "cpu"
     )
+    torch.cuda.set_per_process_memory_fraction(0.2, device=device)
 
     model = models.Dnar(config).to(device)
 
@@ -306,7 +307,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
             opt.zero_grad()
 
             if steps % config.eval_each == 1:
-                val_scores = evaluate(
+                val_scores, test_scores = evaluate(
                     model,
                     val_data,
                     test_data,
@@ -321,7 +322,8 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
                     # Determine metric name
                     metric_name = "pointer_accuracy_graph_level" if config.output_type == "pointer" else "node_mask_accuracy_graph_level"
                     current_score = val_scores.get(metric_name, 0.0)
-                    if session.check_early_stopping(current_score):
+
+                    if (steps >= config.min_iterations or current_score==1.0) and session.check_early_stopping(current_score):
                         print(f"\nEarly stopping triggered! (Val Acc: {current_score:.4f})")
                         training_interrupted = True
                         early_stopped = True
@@ -543,9 +545,10 @@ def train_multitask(configs: List[base_config.Config], seed: int,
     Multitask training with restart support.
     """
     device = torch.device(
-        (f"cuda:{gpu_id}" if gpu_id else get_gpus(1)[0]) 
+        (f"cuda:{gpu_id}" if gpu_id is not None else get_gpus(1)[0]) 
         if torch.cuda.is_available() else "cpu"
     )
+    torch.cuda.set_per_process_memory_fraction(0.2, device=device)
     
     
     # Validate configs
@@ -830,6 +833,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
             writer.log_dict(round_metrics_buffer, step=min_steps + 1)
 
         # --- EARLY STOPPING CHECK ---
+        #if done at least min_iterations
         # Only check if we actually evaluated this round (look for keys in buffer)
         if session and any("/val" in k for k in round_metrics_buffer):
             # Determine metric name based on output type
@@ -846,12 +850,12 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                 # Average across algorithms
                 avg_val_acc = sum(val_accs) / len(val_accs)
                 
-                if session.check_early_stopping(avg_val_acc):
+                if (min_steps+1 > unified_config.min_iterations or avg_val_acc == 1.0) and session.check_early_stopping(avg_val_acc):
                     print(f"\nEarly stopping triggered! (Avg Val Acc: {avg_val_acc:.4f})")
                     training_interrupted = True
                     early_stopped = True
                     break
-                
+
         #Break if interrupted
         if training_interrupted:
             break
@@ -1066,6 +1070,7 @@ def train_worker(args):
     # --- Device setup ---
     torch.cuda.set_device(gpu_id)
     device = torch.device(f"cuda:{gpu_id}")
+    torch.cuda.set_per_process_memory_fraction(0.2, device=device)
 
     # --- Reproducibility ---
     np.random.seed(seed)
@@ -1123,6 +1128,7 @@ if __name__ == "__main__":
                              "1) A single config with 'multitask_algorithms' list, or "
                              "2) Comma-separated paths to multiple config files")
     parser.add_argument("--num_seeds", type=int, default=3, help="Number of random seeds to train, If set on restart this many seeds will be checked for incomplete jobs.")
+    parser.add_argument("--seed_start", type=int, default=42, help="Starting seed value (default: 42)")
     parser.add_argument("--multitask", action="store_true",
                         help="Enable multitask training")
     parser.add_argument("--parallel", action="store_true",
@@ -1233,7 +1239,8 @@ if __name__ == "__main__":
 
         else:
             manager = RestartManager()
-            job = manager.get_next_job()
+            filter = options.config_path if options.config_path else None
+            job = manager.get_next_job(filter=filter)
             
             if job is None:
                 print("No incomplete jobs found.")
@@ -1279,7 +1286,7 @@ if __name__ == "__main__":
             
             exit()
     
-    seeds = list(range(40, 40 + options.num_seeds))
+    seeds = list(range(options.seed_start, options.seed_start + options.num_seeds))
     
     if options.parallel:
         # Bestimme verfügbare GPUs
@@ -1297,7 +1304,7 @@ if __name__ == "__main__":
         if not gpu_ids:
             raise ValueError("No GPUs available for parallel training")
         
-        num_workers = min(len(seeds), len(gpu_ids))
+        num_workers = min(len(seeds), len(gpu_ids)*2)
         print("\nParallel training:")
         print(f"  Workers: {num_workers}")
         print(f"  Seeds: {seeds}")

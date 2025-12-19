@@ -2,7 +2,7 @@ algorithm: bfs
 
 # --- data ---
 num_samples:
-  train: 1000
+  train: 10000
   val: 320
   test: 320
 
