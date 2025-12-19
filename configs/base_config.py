@@ -6,7 +6,7 @@ import yaml
 
 @dataclass
 class Config:
-    algorithm: str = None
+    algorithm: str = "bfs" #just the default
     name: Optional[str] = None #can be used to give a name to the experiment other than the algorithm
     graph_type: Optional[str] = None
     use_lazy_dataset: bool = False
@@ -27,6 +27,7 @@ class Config:
     problem_size: dict = None
     edge_weights: bool = False
     generate_random_numbers: bool = False
+    graph_type: str = "er"
 
     # --- model ---
     h: int = 128
@@ -47,6 +48,10 @@ class Config:
     # List of algorithm names for multitask (optional, for documentation)
     # you may also just call the model.forward with algorithm names directly.
     multitask_algorithms: Optional[List[str]] = None
+
+    # --- data cache ---
+    use_dataset_cache: bool = True
+    cache_directory: str = '/hpcwork/sg114224/dnar_cache'
 
     # --- logs, io ---
     models_directory: str = 'models'

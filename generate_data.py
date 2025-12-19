@@ -694,6 +694,7 @@ class GeometricGraphSampler:
     """
     def __init__(self, config):
         self.weighted = True  # A* requires weighted edges
+        self.generate_random_numbers = config.generate_random_numbers
         
     def __call__(self, num_nodes):
         # 1. Generate random coordinates in [0, 1]
@@ -758,6 +759,10 @@ class GeometricGraphSampler:
         while start == goal:
             goal = np.random.randint(0, final_n)
 
+        random_numbers = None
+        if self.generate_random_numbers:
+            random_numbers = np.random.rand(final_n, final_n)
+
         # Return the ProblemInstance compatible with your code
         # Pass final_pos so the A* function can calculate h(n)
         return ProblemInstance(
@@ -765,13 +770,14 @@ class GeometricGraphSampler:
             start=start, 
             goal=goal, 
             weighted=True, 
-            randomness=None, 
+            randomness=random_numbers, 
             pos=final_pos
         )
 
 class GridGraphSampler:
     def __init__(self, config):
         self.weighted = True 
+        self.generate_random_numbers = config.generate_random_numbers
         
     def __call__(self, num_nodes):
         side = int(math.sqrt(num_nodes))
@@ -799,12 +805,21 @@ class GridGraphSampler:
         goal = np.random.randint(0, N)
         while start == goal:
              goal = np.random.randint(0, N)
-             
-        return ProblemInstance(adj, start, goal, True, None, pos=pos_arr)
+
+        random_numbers = None
+        if self.generate_random_numbers:
+            random_numbers = np.random.rand(N, N)
+
+        return ProblemInstance(
+            adj, start, goal, True, 
+            random_numbers,
+            pos=pos_arr
+        )
 
 class RoadmapGraphSampler:
     def __init__(self, config):
         self.weighted = True
+        self.generate_random_numbers = config.generate_random_numbers
         
     def __call__(self, num_nodes):
         # Geometric Graph
@@ -836,7 +851,11 @@ class RoadmapGraphSampler:
         goal = np.random.randint(0, N)
         while start == goal: goal = np.random.randint(0, N)
 
-        return ProblemInstance(adj, start, goal, True, None, pos=final_pos)
+        random_numbers = None
+        if self.generate_random_numbers:
+            random_numbers = np.random.rand(N, N)
+
+        return ProblemInstance(adj, start, goal, True, random_numbers, pos=final_pos)
 
 
 # -----------------------------------------------------------------------------
@@ -895,58 +914,14 @@ def _pad_features(tensor: torch.Tensor, target_features: int) -> torch.Tensor:
 
 
 def create_dataloader(config: base_config.Config, split: str, seed: int, device):
-    np.random.seed(seed)
-    datapoints = []
+    """
+    Create dataloader with optional caching.
     
-    # Choose Sampler
-    graph_type = getattr(config, 'graph_type', 'er')
-    if graph_type == 'grid':
-        sampler = GridGraphSampler(config)
-    elif graph_type == 'roadmap':
-        sampler = RoadmapGraphSampler(config)
-    elif graph_type == 'geometric':
-        sampler = GeometricGraphSampler(config)
-    else:
-        sampler = ErdosRenyiGraphSampler(config)
+    Set config.use_dataset_cache = False to disable caching.
+    Set config.cache_directory to customize cache location (default: 'data_cache').
+    """
+    return create_dataloader_with_cache(config, split, seed, device)
 
-    for _ in tqdm.tqdm(
-        range(config.num_samples[split]), f"Generate samples for {split}"
-    ):
-        instance = sampler(config.problem_size[split])
-        
-        node_fts, edge_fts, scalars = ALGORITHMS[config.algorithm](instance)
-
-        edge_index = torch.tensor(instance.edge_index).contiguous()
-
-        # Reshape to (Batch/Time, Nodes, Feats)
-        node_fts = torch.transpose(torch.tensor(node_fts), 0, 1)
-        edge_fts = torch.transpose(
-            torch.tensor(edge_fts)[:, edge_index[0], edge_index[1]], 0, 1
-        )
-        scalars = torch.transpose(torch.tensor(scalars), 0, 1)
-        
-        # Pad features to expected dimensions (important for multitask training)
-        # This ensures data from algorithms with fewer states can work with
-        # models configured for max_node_states/max_edge_states
-        node_fts = _pad_features(node_fts, config.num_node_states)
-        edge_fts = _pad_features(edge_fts, config.num_edge_states)
-
-        output_fts = edge_fts if config.output_type == "pointer" else node_fts
-        y = output_fts[:, -1, config.output_idx].clone().detach()
-
-        datapoints.append(
-            Data(
-                node_fts=node_fts,
-                edge_fts=edge_fts,
-                scalars=scalars,
-                edge_index=edge_index,
-                y=y,
-                # Pass Planning Inputs Explicitly
-                pos=torch.tensor(instance.pos, dtype=torch.float),
-                goal=torch.tensor(instance.goal)
-            ).to(device)
-        )
-    return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True)
 
 class LazyDataset(Dataset):
     def __init__(self, config, split, sampler, algorithm):
@@ -1033,6 +1008,298 @@ def create_lazy_dataloader(config, split, seed, device, num_workers=0):
     return loader
 
 
+
+# ---- DATA CACHING ----
+import pickle
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Optional, List
+import torch
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+
+
+def get_dataset_cache_key(config, split: str, seed: int) -> str:
+    """
+    Generate a unique cache key for a dataset based on config parameters.
+    
+    Only includes parameters that affect data generation, not training.
+    """
+    cache_dict = {
+        'algorithm': config.algorithm,
+        'graph_type': getattr(config, 'graph_type', 'er'),
+        'problem_size': config.problem_size[split],
+        'num_samples': config.num_samples[split],
+        'edge_weights': config.edge_weights,
+        'generate_random_numbers': config.generate_random_numbers,
+        'split': split,
+        'seed': seed,
+    }
+    
+    # Create deterministic hash
+    json_str = json.dumps(cache_dict, sort_keys=True)
+    hash_obj = hashlib.md5(json_str.encode())
+    return hash_obj.hexdigest()
+
+
+def get_cache_path(config, split: str, seed: int) -> Path:
+    """Get the file path for cached dataset."""
+    cache_dir = Path(getattr(config, 'cache_directory', 'data_cache'))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Organize by algorithm and graph type
+    algo_dir = cache_dir / config.algorithm / getattr(config, 'graph_type', 'er')
+    algo_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Include seed explicitly in filename for clarity
+    # Format: split_seed<N>_hash.pkl (e.g., train_seed40_a1b2c3d4.pkl)
+    cache_key = get_dataset_cache_key(config, split, seed)
+    return algo_dir / f"{split}_seed{seed}_{cache_key}.pkl"
+
+
+def save_dataset_to_cache(datapoints: List[Data], cache_path: Path, seed: int):
+    """Save generated dataset to disk with metadata."""
+    try:
+        # Move data to CPU before saving to avoid GPU memory issues
+        cpu_datapoints = [data.cpu() for data in datapoints]
+        
+        # Include metadata for verification
+        cache_data = {
+            'datapoints': cpu_datapoints,
+            'seed': seed,
+            'num_samples': len(cpu_datapoints),
+            'timestamp': time.time(),
+        }
+        
+        with open(cache_path, 'wb') as f:
+            pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        print(f"Dataset cached to: {cache_path} (seed={seed}, n={len(cpu_datapoints)})")
+    except Exception as e:
+        print(f"Warning: Failed to cache dataset: {e}")
+
+
+def load_dataset_from_cache(cache_path: Path, device, expected_seed: int) -> Optional[List[Data]]:
+    """Load dataset from disk cache with seed verification."""
+    if not cache_path.exists():
+        return None
+    
+    try:
+        with open(cache_path, 'rb') as f:
+            cache_data = pickle.load(f)
+        
+        # Handle both old format (just list) and new format (dict with metadata)
+        if isinstance(cache_data, dict):
+            datapoints = cache_data['datapoints']
+            cached_seed = cache_data.get('seed')
+            
+            # Verify seed matches
+            if cached_seed is not None and cached_seed != expected_seed:
+                print(f"Warning: Cached seed {cached_seed} != expected {expected_seed}. Regenerating...")
+                return None
+            
+            print(f"Dataset loaded from cache: {cache_path} (seed={cached_seed}, n={len(datapoints)})")
+        else:
+            # Old format - just the datapoints
+            datapoints = cache_data
+            print(f"Dataset loaded from cache: {cache_path} (legacy format)")
+        
+        # Move to target device
+        datapoints = [data.to(device) for data in datapoints]
+        
+        return datapoints
+    except Exception as e:
+        print(f"Warning: Failed to load cached dataset: {e}")
+        return None
+
+
+def create_dataloader_with_cache(config, split: str, seed: int, device):
+    """
+    Create dataloader with caching support.
+    
+    Checks cache first, generates and saves if not found.
+    """
+    # Check if caching is enabled (default: True)
+    use_cache = getattr(config, 'use_dataset_cache', True)
+    
+    if use_cache:
+        cache_path = get_cache_path(config, split, seed)
+        
+        # Try to load from cache
+        datapoints = load_dataset_from_cache(cache_path, device, expected_seed=seed)
+        
+        if datapoints is not None:
+            return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True)
+    
+    # Generate data (original logic)
+    np.random.seed(seed)
+    datapoints = []
+    
+    # Choose Sampler
+    graph_type = getattr(config, 'graph_type', 'er')
+    if graph_type == 'grid':
+        sampler = GridGraphSampler(config)
+    elif graph_type == 'roadmap':
+        sampler = RoadmapGraphSampler(config)
+    elif graph_type == 'geometric':
+        sampler = GeometricGraphSampler(config)
+    else:
+        sampler = ErdosRenyiGraphSampler(config)
+
+    for _ in tqdm.tqdm(
+        range(config.num_samples[split]), f"Generate samples for {split} (seed={seed})"
+    ):
+        instance = sampler(config.problem_size[split])
+        
+        node_fts, edge_fts, scalars = ALGORITHMS[config.algorithm](instance)
+
+        edge_index = torch.tensor(instance.edge_index).contiguous()
+
+        # Reshape to (Batch/Time, Nodes, Feats)
+        node_fts = torch.transpose(torch.tensor(node_fts), 0, 1)
+        edge_fts = torch.transpose(
+            torch.tensor(edge_fts)[:, edge_index[0], edge_index[1]], 0, 1
+        )
+        scalars = torch.transpose(torch.tensor(scalars), 0, 1)
+        
+        # Pad features to expected dimensions
+        node_fts = _pad_features(node_fts, config.num_node_states)
+        edge_fts = _pad_features(edge_fts, config.num_edge_states)
+
+        output_fts = edge_fts if config.output_type == "pointer" else node_fts
+        y = output_fts[:, -1, config.output_idx].clone().detach()
+
+        datapoints.append(
+            Data(
+                node_fts=node_fts,
+                edge_fts=edge_fts,
+                scalars=scalars,
+                edge_index=edge_index,
+                y=y,
+                pos=torch.tensor(instance.pos, dtype=torch.float),
+                goal=torch.tensor(instance.goal)
+            ).to(device)
+        )
+    
+    # Save to cache
+    if use_cache:
+        save_dataset_to_cache(datapoints, cache_path, seed)
+    
+    return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True)
+
+def clear_cache(algorithm: Optional[str] = None, graph_type: Optional[str] = None):
+    """
+    Clear cached datasets.
+    
+    Args:
+        algorithm: If specified, only clear this algorithm's cache
+        graph_type: If specified, only clear this graph type's cache
+    """
+    cache_dir = Path(getattr(config, 'cache_directory', 'data_cache'))
+    
+    if not cache_dir.exists():
+        print("No cache directory found.")
+        return
+    
+    if algorithm and graph_type:
+        target = cache_dir / algorithm / graph_type
+        if target.exists():
+            import shutil
+            shutil.rmtree(target)
+            print(f"Cleared cache for {algorithm}/{graph_type}")
+    elif algorithm:
+        target = cache_dir / algorithm
+        if target.exists():
+            import shutil
+            shutil.rmtree(target)
+            print(f"Cleared cache for {algorithm}")
+    else:
+        import shutil
+        shutil.rmtree(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        print("Cleared entire cache")
+
+
+def get_cache_info():
+    """Print information about cached datasets."""
+    cache_dir = Path(getattr(config, 'cache_directory', 'data_cache'))
+    
+    if not cache_dir.exists():
+        print("No cache directory found.")
+        return
+    
+    total_size = 0
+    cache_files = []
+    
+    for cache_file in cache_dir.rglob('*.pkl'):
+        size = cache_file.stat().st_size
+        total_size += size
+        
+        # Parse path: data_cache/algorithm/graph_type/split_seed40_hash.pkl
+        parts = cache_file.parts
+        if len(parts) >= 4:
+            algorithm = parts[-3]
+            graph_type = parts[-2]
+            filename = parts[-1]
+            
+            # Extract split and seed from filename
+            parts_name = filename.replace('.pkl', '').split('_')
+            split = parts_name[0]
+            seed = None
+            if len(parts_name) > 1 and parts_name[1].startswith('seed'):
+                seed = parts_name[1].replace('seed', '')
+            
+            # Try to load metadata
+            try:
+                with open(cache_file, 'rb') as f:
+                    data = pickle.load(f)
+                if isinstance(data, dict):
+                    metadata_seed = data.get('seed')
+                    num_samples = data.get('num_samples')
+                else:
+                    metadata_seed = None
+                    num_samples = len(data)
+            except:
+                metadata_seed = None
+                num_samples = '?'
+            
+            cache_files.append({
+                'algorithm': algorithm,
+                'graph_type': graph_type,
+                'split': split,
+                'seed': seed or metadata_seed or '?',
+                'num_samples': num_samples,
+                'size_mb': size / (1024 * 1024),
+                'path': str(cache_file)
+            })
+    
+    if not cache_files:
+        print("No cached datasets found.")
+        return
+    
+    print(f"\nCached Datasets ({len(cache_files)} files, {total_size / (1024**2):.2f} MB total)")
+    print("=" * 90)
+    
+    # Group by algorithm and graph_type
+    from collections import defaultdict
+    by_algo = defaultdict(list)
+    
+    for cf in cache_files:
+        key = f"{cf['algorithm']}/{cf['graph_type']}"
+        by_algo[key].append(cf)
+    
+    for key, files in sorted(by_algo.items()):
+        total = sum(f['size_mb'] for f in files)
+        splits = sorted(set(f['split'] for f in files))
+        seeds = sorted(set(str(f['seed']) for f in files))
+        
+        print(f"{key:30s} | {len(files):2d} files | {total:6.2f} MB | "
+              f"splits: {', '.join(splits)} | seeds: {', '.join(seeds)}")
+
+
+
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument(
@@ -1048,7 +1315,18 @@ if __name__ == "__main__":
         help="Random seed for data generation.",
     )
 
+    argparser.add_argument('--clear', action='store_true', help='Clear cache')
+    argparser.add_argument('--algorithm', type=str, help='Target algorithm')
+    argparser.add_argument('--graph_type', type=str, help='Target graph type')
+    argparser.add_argument('--info', action='store_true', help='Show cache info')
+
     args = argparser.parse_args()
+
+    if args.info or (not args.clear):
+        get_cache_info()
+    
+    if args.clear:
+        clear_cache(args.algorithm, args.graph_type)
 
     #check if its a valid config file
     if not os.path.exists(args.config):
