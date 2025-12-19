@@ -548,26 +548,25 @@ correct_filter = lambda g: g["is_correct"]
 low_acc_filter = lambda g: g["metrics"].get("pointer_accuracy", g["metrics"].get("node_mask_accuracy", 1.0)) < 0.8
 n_mistakes_filter = lambda n: lambda g: g["pointer_mistakes"] >= n
 
-#makes too many 
-# class ModelSaver:
-#     def __init__(self, models_directory: str, model_name: str):
-#         Path(models_directory).mkdir(parents=True, exist_ok=True)
-#         model_name = "{}/{}".format(models_directory, model_name)
+class ModelSaver:
+    def __init__(self, models_directory: str, model_name: str):
+        Path(models_directory).mkdir(parents=True, exist_ok=True)
+        model_name = "{}/{}".format(models_directory, model_name)
 
-#         self.best_vals = defaultdict(float)
-#         self.model_name = model_name
+        self.best_vals = defaultdict(float)
+        self.model_name = model_name
 
-#     def visit(self, model, metrics_stat):
-#         for metric in metrics_stat:
-#             if metrics_stat[metric] > self.best_vals[metric]:
-#                 self.best_vals[metric] = metrics_stat[metric]
-#                 self.save(model, metric + "_best")
-#         self.save(model, "last")
+    def visit(self, model, metrics_stat):
+        for metric in metrics_stat:
+            if metrics_stat[metric] > self.best_vals[metric]:
+                self.best_vals[metric] = metrics_stat[metric]
+                self.save(model, metric + "_best")
+        self.save(model, "last")
 
-#     def save(self, model, suffix):
-#         path = "{}_{}.pt".format(self.model_name, suffix)
-#         print("saving model: ", path)
-#         torch.save(model.state_dict(), path)
+    def save(self, model, suffix):
+        path = "{}_{}.pt".format(self.model_name, suffix)
+        print("saving model: ", path)
+        torch.save(model.state_dict(), path)
 
 
 NODE_POINTER_METRICS = (pointer_accuracy, pointer_accuracy_graph_level)
@@ -925,7 +924,7 @@ Handles:
 - State tracking across restarts
 """
 class TrainingSession:
-    """Manages training state for restartable sessions."""
+    """Manages training state for restartable sessions with multitask support."""
     
     def __init__(
         self,
@@ -933,16 +932,19 @@ class TrainingSession:
         seed: int,
         max_runtime_seconds: int = 1500,  # 25 minutes
         temp_dir: Optional[str] = None,
-        multitask: bool = False
+        multitask: bool = False,
+        algorithms: Optional[list] = None
     ):
         self.config_path = config_path
         self.seed = seed
         self.max_runtime_seconds = max_runtime_seconds
         self.multitask = multitask
+        self.algorithms = algorithms or []
         self.start_time = time.time()
         
         # Setup temp directory
         if temp_dir is None:
+            import os
             user = os.environ.get('USER', 'default')
             temp_dir = f"/tmp/{user}/experiments"
         self.temp_dir = Path(temp_dir)
@@ -957,6 +959,9 @@ class TrainingSession:
     def _get_session_id(self) -> str:
         """Generate unique session ID from config and seed."""
         config_name = Path(self.config_path).stem
+        if self.multitask:
+            algo_str = "_".join(sorted(self.algorithms))
+            return f"{config_name}_multitask_{algo_str}_seed{self.seed}"
         return f"{config_name}_seed{self.seed}"
     
     def _load_state(self) -> Dict[str, Any]:
@@ -965,26 +970,38 @@ class TrainingSession:
             with open(self.state_file, 'r') as f:
                 state = json.load(f)
             print(f"Resuming training from step {state.get('current_step', 0)}")
+            
+            # For multitask, restore algorithm order
+            if self.multitask and 'algorithms' in state:
+                self.algorithms = state['algorithms']
+            
             return state
         else:
             return {
                 "config_path": self.config_path,
                 "seed": self.seed,
                 "multitask": self.multitask,
+                "algorithms": self.algorithms if self.multitask else [],
                 "current_step": 0,
+                "steps_per_algorithm": {alg: 0 for alg in self.algorithms} if self.multitask else {},
                 "completed": False,
                 "restarts": 0,
                 "total_runtime": 0.0,
                 "last_checkpoint": None,
             }
     
-    def save_state(self, current_step: int, checkpoint_path: Optional[str] = None):
+    def save_state(self, current_step: int, checkpoint_path: Optional[str] = None,
+                   steps_per_algorithm: Optional[Dict[str, int]] = None):
         """Save current training state."""
         self.state["current_step"] = current_step
         self.state["restarts"] = self.state.get("restarts", 0)
         self.state["total_runtime"] = self.state.get("total_runtime", 0.0) + self.elapsed_time()
+        
         if checkpoint_path:
             self.state["last_checkpoint"] = checkpoint_path
+        
+        if steps_per_algorithm:
+            self.state["steps_per_algorithm"] = steps_per_algorithm
         
         with open(self.state_file, 'w') as f:
             json.dump(self.state, f, indent=2)
@@ -1008,7 +1025,8 @@ class TrainingSession:
     
     def should_stop(self) -> bool:
         """Check if we should stop training to avoid timeout."""
-        return self.elapsed_time() >= self.max_runtime_seconds
+        # Leave 30 seconds buffer for checkpoint saving
+        return self.elapsed_time() >= (self.max_runtime_seconds - 30)
     
     def is_completed(self) -> bool:
         """Check if training is completed."""
@@ -1018,9 +1036,19 @@ class TrainingSession:
         """Get step to resume from."""
         return self.state.get("current_step", 0)
     
+    def get_steps_per_algorithm(self) -> Dict[str, int]:
+        """Get per-algorithm step counts (for multitask)."""
+        return self.state.get("steps_per_algorithm", {})
+    
     def get_last_checkpoint(self) -> Optional[str]:
         """Get path to last checkpoint."""
         return self.state.get("last_checkpoint")
+    
+    def increment_restart_count(self):
+        """Increment restart counter."""
+        self.state["restarts"] = self.state.get("restarts", 0) + 1
+        with open(self.state_file, 'w') as f:
+            json.dump(self.state, f, indent=2)
     
     def cleanup(self):
         """Clean up temporary files after successful completion."""
@@ -1125,3 +1153,67 @@ def finalize_model(temp_model_path: str, final_model_path: str):
     if temp_path.exists():
         temp_path.unlink()
 
+def save_multitask_checkpoint(model, checkpoint_path: str, step: int, 
+                               algorithm_dict: Optional[Dict[str, int]] = None):
+    """
+    Save a complete checkpoint including multitask state.
+    
+    Args:
+        model: The model to save
+        checkpoint_path: Path to save checkpoint
+        step: Current training step
+        algorithm_dict: Optional dict mapping algorithm names to indices
+    """
+    checkpoint = {
+        'step': step,
+        'model_state_dict': model.state_dict(),
+    }
+    
+    # Add multitask registry state if enabled
+    if hasattr(model, '_multitask_registry'):
+        registry = model._multitask_registry
+        checkpoint['multitask_state'] = {
+            'num_algorithms': registry.num_algorithms,
+            'algorithm_dict': registry.algorithm_dict.copy(),
+        }
+    
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to: {checkpoint_path}")
+
+
+def load_multitask_checkpoint(model, checkpoint_path: str) -> int:
+    """
+    Load a checkpoint including multitask state.
+    
+    Args:
+        model: The model to load into
+        checkpoint_path: Path to checkpoint file
+    
+    Returns:
+        Training step to resume from
+    """
+    checkpoint = torch.load(checkpoint_path)
+    
+    # Load model weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Restore multitask registry if present
+    if 'multitask_state' in checkpoint and hasattr(model, '_multitask_registry'):
+        registry = model._multitask_registry
+        multitask_state = checkpoint['multitask_state']
+        
+        # Verify compatibility
+        if registry.num_algorithms != multitask_state['num_algorithms']:
+            raise ValueError(
+                f"Checkpoint has {multitask_state['num_algorithms']} algorithms, "
+                f"but model has {registry.num_algorithms}"
+            )
+        
+        # Restore algorithm dictionary
+        registry.algorithm_dict = multitask_state['algorithm_dict'].copy()
+        
+        print(f"Restored multitask state with algorithms: {list(registry.algorithm_dict.keys())}")
+    
+    step = checkpoint.get('step', 0)
+    print(f"Checkpoint loaded from step {step}")
+    return step

@@ -37,7 +37,7 @@ problem_size:
   val: 16
   test: 16
 edge_weights: false
-generate_random_numbers: false
+generate_random_numbers: true  # For algorithms that require randomness (e.g., MIS)
 
 # Model architecture
 h: 128
