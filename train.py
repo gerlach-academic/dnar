@@ -29,7 +29,7 @@ class DualLogger:
     """
     A logger that writes to both TensorBoard and Weights & Biases.
     """
-    def __init__(self, tb_writer: Optional[SummaryWriter] = None, wandb_writer: Optional[object] = None):
+    def __init__(self, tb_writer: Optional[SummaryWriter] = None, wandb_writer: Optional[wandb.sdk.wandb_run.Run] = None):
         self.tb_writer = tb_writer
         self.wandb_writer = wandb_writer
         self.use_wandb = (wandb_writer is not None) and WANDB_AVAILABLE
@@ -47,6 +47,12 @@ class DualLogger:
         if self.use_wandb:
             # Note: This might increment the internal step if called repeatedly.
             # Use log_dict for atomic multi-metric logging.
+            if self.wandb_writer is not None and global_step <= self.wandb_writer.step:
+                if not getattr(self, "_wandb_ahead_warning_shown", False):
+                    print(f"Warning: WandB is ahead (step {self.wandb_writer.step}) of local (step {global_step}). "
+                            "Skipping redundant logs until caught up.")
+                    self._wandb_ahead_warning_shown = True
+                return
             try:
                 if isinstance(scalar_value, dict):
                     log_dict = {f"{tag}/{k}": v for k, v in scalar_value.items()}
@@ -69,6 +75,12 @@ class DualLogger:
                 else:
                     self.tb_writer.add_scalar(tag, value, step)
         if self.use_wandb:
+            if self.wandb_writer is not None and step <= self.wandb_writer.step:
+                if not getattr(self, "_wandb_ahead_warning_shown", False):
+                    print(f"Warning: WandB history (step {self.wandb_writer.step}) is ahead of local training (step {step}). "
+                            "Skipping upload of replayed steps.")
+                    self._wandb_ahead_warning_shown = True
+                return
             try:
                 #unify the double dict case
                 log_dict = {}
@@ -260,6 +272,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
 
     steps = resume_from_step
     training_interrupted = False
+    early_stopped = False
     while steps <= config.num_iterations:
         for batch in train_data:
             # Skip batches until we reach resume point (already at resume_from_step)
@@ -293,7 +306,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
             opt.zero_grad()
 
             if steps % config.eval_each == 1:
-                evaluate(
+                val_scores = evaluate(
                     model,
                     val_data,
                     test_data,
@@ -302,6 +315,17 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
                     writer,
                     steps,
                 )
+
+                #early stopping check
+                if session:
+                    # Determine metric name
+                    metric_name = "pointer_accuracy_graph_level" if config.output_type == "pointer" else "node_mask_accuracy_graph_level"
+                    current_score = val_scores.get(metric_name, 0.0)
+                    if session.check_early_stopping(current_score):
+                        print(f"\nEarly stopping triggered! (Val Acc: {current_score:.4f})")
+                        training_interrupted = True
+                        early_stopped = True
+                        break
             
             # Progress logging
             if steps % 100 == 0:
@@ -367,10 +391,12 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
             break
     
     if training_interrupted:
-        print(f"\nTraining interrupted at step {steps}. Restart with --restart to continue.")
-        if writer is not None:
-            writer.close()
-        return None
+        if not early_stopped:
+            print(f"\nTraining interrupted at step {steps}. Restart with --restart to continue.")
+            #don't close as this will finish the runs
+            # if writer is not None:
+            #     writer.close()
+            return None
     
     # Final evaluation
     print("\n" + "=" * 60)
@@ -657,14 +683,22 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         print(f"  - Restarts so far: {session.state.get('restarts', 0)}")
     
     training_interrupted = False
-    
+    early_stopped = False
     while steps < total_steps:
-        round_metrics_buffer = {alg: {} for alg in algorithms}
+        #get the minimum steps across algorithms to have all algorithms aligned
+        # 1. Determine the "floor" progress across all algorithms
+        min_steps = min(steps_per_algorithm.values())
+        
+        round_metrics_buffer = {}
 
-        # Cycle through algorithms - one batch each per round
         for algorithm in algorithms:
-            if steps >= total_steps:
-                break
+            if steps >= total_steps: break
+            
+            # 3. SKIP AHEAD LOGIC
+            # If this algorithm is ahead of the pack (from a previous partial run),
+            # skip it until others catch up.
+            if steps_per_algorithm[algorithm] > min_steps:
+                continue
             
             #Check timeout
             if session and session.should_stop():
@@ -790,21 +824,47 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                 
                 next_checkpoint += checkpoint_interval
                 print(f"{'='*60}\n")
-        
-        #Break if interrupted
-        if training_interrupted:
-            break
 
         #write buffered metrics for this round
         if writer is not None:
-            writer.log_dict(round_metrics_buffer, step=steps_per_algorithm[algorithms[0]])
+            writer.log_dict(round_metrics_buffer, step=min_steps + 1)
+
+        # --- EARLY STOPPING CHECK ---
+        # Only check if we actually evaluated this round (look for keys in buffer)
+        if session and any("/val" in k for k in round_metrics_buffer):
+            # Determine metric name based on output type
+            metric_name = "pointer_accuracy_graph_level" if unified_config.output_type == "pointer" else "node_mask_accuracy_graph_level"
+            
+            # Extract scores for this specific metric across all algorithms
+            # Key format: "{algorithm}/{metric_name}/val"
+            val_accs = []
+            for k, v in round_metrics_buffer.items():
+                if k.endswith(f"/{metric_name}/val"):
+                    val_accs.append(v)
+            
+            if val_accs:
+                # Average across algorithms
+                avg_val_acc = sum(val_accs) / len(val_accs)
+                
+                if session.check_early_stopping(avg_val_acc):
+                    print(f"\nEarly stopping triggered! (Avg Val Acc: {avg_val_acc:.4f})")
+                    training_interrupted = True
+                    early_stopped = True
+                    break
+                
+        #Break if interrupted
+        if training_interrupted:
+            break
     
     #Handle interruption
     if training_interrupted:
-        print(f"\nTraining interrupted at step {steps}. Restart with --restart to continue.")
-        if writer is not None:
-            writer.close()
-        return None
+        if not early_stopped:
+            print(f"\nTraining interrupted at step {steps}. Restart with --restart to continue.")
+            #don't close as this will finish the runs
+            # if writer is not None:
+            #     writer.close()
+            return None
+        #else: if early stopped continue to final evaluation
 
     # Final evaluation on all algorithms (rest remains mostly the same but save with multitask state)
     print("\n" + "=" * 60)
@@ -994,10 +1054,14 @@ def _save_training_summary_single(checkpoint_dir: Path, algorithm: str, total_st
 # Worker function für paralleles Training
 def train_worker(args):
     """Worker für paralleles Training eines einzelnen Seeds"""
-    options, seed, gpu_id = args
-    config_path = options.config_path
-    multitask = options.multitask
-    max_runtime_minutes = options.max_runtime_minutes
+    if len(args)==3:
+        options, seed, gpu_id = args
+        config_path = options.config_path
+        multitask = options.multitask
+        max_runtime_minutes = options.max_runtime_minutes
+        patience = options.patience
+    else:
+        raise ValueError("Invalid number of arguments for train_worker")
     
     # --- Device setup ---
     torch.cuda.set_device(gpu_id)
@@ -1028,9 +1092,9 @@ def train_worker(args):
         seed,
         max_runtime_seconds=max_runtime_minutes * 60,
         multitask=multitask,
-        algorithms=algorithms
+        algorithms=algorithms,
+        patience=patience,
     )
-    session.increment_restart_count()
 
     # --- Training ---
     if multitask:
@@ -1058,7 +1122,7 @@ if __name__ == "__main__":
                         help="Path to config file. For multitask, can be: "
                              "1) A single config with 'multitask_algorithms' list, or "
                              "2) Comma-separated paths to multiple config files")
-    parser.add_argument("--num_seeds", type=int, default=3)
+    parser.add_argument("--num_seeds", type=int, default=3, help="Number of random seeds to train, If set on restart this many seeds will be checked for incomplete jobs.")
     parser.add_argument("--multitask", action="store_true",
                         help="Enable multitask training")
     parser.add_argument("--parallel", action="store_true",
@@ -1075,8 +1139,10 @@ if __name__ == "__main__":
                         help="Clean up all incomplete training job state files")
     parser.add_argument("--clean_job", type=str, default=None,
                         help="Clean up specific job by session ID (e.g., 'bfs_seed40')")
-    parser.add_argument("--max_runtime_minutes", type=int, default=25,
-                        help="Maximum runtime per training session in minutes (default: 25)")
+    parser.add_argument("--max_runtime_minutes", type=int, default=23,
+                        help="Maximum runtime per training session in minutes (default: 23)")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Early stopping patience in number of evaluations (default: 5)")
 
     options = parser.parse_args()
     
@@ -1099,52 +1165,119 @@ if __name__ == "__main__":
     
     # Handle restart mode
     if options.restart:
-        manager = RestartManager()
-        job = manager.get_next_job()
-        
-        if job is None:
-            print("No incomplete jobs found.")
-            exit()
-        
-        print(f"\nRestarting incomplete job:")
-        print(f"  Config: {job['config_path']}")
-        print(f"  Seed: {job['seed']}")
-        print(f"  Current step: {job['current_step']}")
-        print(f"  Restarts: {job.get('restarts', 0)}")
-        
-        #Get algorithms for multitask
-        algorithms = job.get('algorithms', [])
-        
-        # Create session and train
-        session = TrainingSession(
-            job['config_path'],
-            job['seed'],
-            max_runtime_seconds=options.max_runtime_minutes * 60,
-            multitask=job.get('multitask', False),
-            algorithms=algorithms 
-        )
-        session.increment_restart_count()
-        
-        np.random.seed(job['seed'])
-        torch.manual_seed(job['seed'])
-        
-        if job.get('multitask', False):
-            # Multitask restart
-            if "," in job['config_path']:
-                config_paths = [p.strip() for p in job['config_path'].split(",")]
-                configs = [base_config.read_config(path) for path in config_paths]
+        if options.parallel:
+            num_workers = options.num_workers if options.num_workers else options.num_seeds
+            print(f"\nParallel restart of incomplete jobs with {num_workers} workers...")
+            num_jobs = options.num_seeds
+
+            manager = RestartManager()
+            restart_filter = options.config_path if options.config_path else None
+            jobs = manager.get_next_jobs(num_jobs=num_jobs, filter=restart_filter)
+
+            if not jobs:
+                print("No incomplete jobs found.")
+                exit()
+
+            if len(jobs) < num_jobs:
+                print(f"Only found {len(jobs)} incomplete jobs, fewer than requested {num_jobs}. Running Anyways.")
+            if len(jobs) < num_workers:
+                num_workers = len(jobs)
+                print(f"Reducing number of workers to {num_workers}.")
+
+            #get gpu odering
+            if options.gpus:
+                gpu_ids = [int(x.strip()) for x in options.gpus.split(',')]
             else:
-                base_cfg = base_config.read_config(job['config_path'])
-                if not base_cfg.multitask_algorithms:
-                    raise ValueError("Config must have multitask_algorithms set")
-                configs = configs_from_multitask_config(base_cfg)
-            
-            model = train_multitask(configs, job['seed'], session=session)
+                try:
+                    gpu_ids = get_least_used_gpus()
+                except Exception as e:
+                    if 'CUDA_VISIBLE_DEVICES' in os.environ:
+                        gpu_ids = [int(x) for x in os.environ['CUDA_VISIBLE_DEVICES'].split(',') if x]
+                    else:
+                        gpu_ids = list(range(torch.cuda.device_count()))
+            if not gpu_ids:
+                raise ValueError("No GPUs available for parallel training")
+            print(f"\nUsing GPUs: {gpu_ids[:min(num_workers, len(gpu_ids))]}")
+
+            worker_args = []
+            for i, job in enumerate(jobs):
+                gpu_id = gpu_ids[i % len(gpu_ids)]
+                #get the session parameters and prepare the options object
+                config_path = job['config_path']
+                multitask = job.get('multitask', False)
+                worker_args.append((
+                    argparse.Namespace(
+                        config_path=config_path,
+                        num_seeds=1,
+                        multitask=multitask,
+                        parallel=False,
+                        num_workers=1,
+                        gpus=str(gpu_id),
+                        restart=False,
+                        list_jobs=False,
+                        clean_jobs=False,
+                        clean_job=None,
+                        max_runtime_minutes=options.max_runtime_minutes,
+                        patience=job.get('patience', options.patience)
+                    ),                    
+                    job['seed'],
+                    gpu_id
+                ))
+                algorithms = job.get('algorithms', [])
+                
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(processes=num_workers) as pool:
+                results = pool.map(train_worker, worker_args)
+
+            print(f"\nAll restarted jobs completed: {results}")
+
         else:
-            config = base_config.read_config(job['config_path'])
-            model = train(config, job['seed'], session=session)
-        
-        exit()
+            manager = RestartManager()
+            job = manager.get_next_job()
+            
+            if job is None:
+                print("No incomplete jobs found.")
+                exit()
+            
+            print(f"\nRestarting incomplete job:")
+            print(f"  Config: {job['config_path']}")
+            print(f"  Seed: {job['seed']}")
+            print(f"  Current step: {job['current_step']}")
+            print(f"  Restarts: {job.get('restarts', 0)}")
+            
+            #Get algorithms for multitask
+            algorithms = job.get('algorithms', [])
+            
+            # Create session and train
+            session = TrainingSession(
+                job['config_path'],
+                job['seed'],
+                max_runtime_seconds=options.max_runtime_minutes * 60,
+                multitask=job.get('multitask', False),
+                algorithms=algorithms,
+                patience=options.patience
+            )
+            
+            np.random.seed(job['seed'])
+            torch.manual_seed(job['seed'])
+            
+            if job.get('multitask', False):
+                # Multitask restart
+                if "," in job['config_path']:
+                    config_paths = [p.strip() for p in job['config_path'].split(",")]
+                    configs = [base_config.read_config(path) for path in config_paths]
+                else:
+                    base_cfg = base_config.read_config(job['config_path'])
+                    if not base_cfg.multitask_algorithms:
+                        raise ValueError("Config must have multitask_algorithms set")
+                    configs = configs_from_multitask_config(base_cfg)
+                
+                model = train_multitask(configs, job['seed'], session=session)
+            else:
+                config = base_config.read_config(job['config_path'])
+                model = train(config, job['seed'], session=session)
+            
+            exit()
     
     seeds = list(range(40, 40 + options.num_seeds))
     
@@ -1206,9 +1339,9 @@ if __name__ == "__main__":
                 seed,
                 max_runtime_seconds=options.max_runtime_minutes * 60,
                 multitask=options.multitask,
-                algorithms=algorithms 
+                algorithms=algorithms,
+                patience=options.patience,
             )
-            session.increment_restart_count()
 
             if options.multitask:
                 model = train_multitask(configs, seed, session=session)
