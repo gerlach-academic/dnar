@@ -977,12 +977,16 @@ class TrainingSession:
                 state = json.load(f)
             print(f"Resuming training from step {state.get('current_step', 0)}")
             
-            # For multitask, restore algorithm order
             if self.multitask and 'algorithms' in state:
                 self.algorithms = state['algorithms']
             
             return state
         else:
+            # FRESH START: Generate a unique ID with timestamp
+            # This ensures we don't merge with old deleted runs on WandB
+            unique_suffix = int(time.time())
+            wandb_id = f"{self._get_session_id()}_{unique_suffix}"
+            
             return {
                 "config_path": self.config_path,
                 "seed": self.seed,
@@ -994,7 +998,15 @@ class TrainingSession:
                 "restarts": 0,
                 "total_runtime": 0.0,
                 "last_checkpoint": None,
+                "wandb_run_id": wandb_id,  # <--- Persist the unique ID
             }
+
+    def get_wandb_run_id(self) -> str:
+        """Get the persistent WandB run ID for this session."""
+        # Fallback if key missing in old state files
+        if "wandb_run_id" not in self.state:
+            self.state["wandb_run_id"] = f"{self._get_session_id()}_{int(time.time())}"
+        return self.state["wandb_run_id"]
     
     def save_state(self, current_step: int, checkpoint_path: Optional[str] = None,
                    steps_per_algorithm: Optional[Dict[str, int]] = None):
