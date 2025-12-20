@@ -1,8 +1,9 @@
+import argparse
 import json
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, overload
 import numpy as np
 import torch
 from torch_geometric.utils import group_argsort, scatter, softmax
@@ -10,6 +11,7 @@ import time
 import os
 import shutil
 from generate_data import MASK
+from configs import base_config
 
 
 # def reverse_edge_index(edge_index): #dunno how this was supposed to work lol 
@@ -99,32 +101,65 @@ def node_mask_accuracy(graph, prediction):
 def node_mask_accuracy_graph_level(graph, prediction):
     return 1.0 * (node_mask_accuracy(graph, prediction) == 1.0)
 
+def score(data, batched_prediction, calculators, output_type) -> Dict[str, float]:
+    """
+    Scores a batch of graphs using provided calculators.
+    Args:
+        data: PyG batch with multiple graphs
+        batched_prediction: Model predictions for the batch
+        calculators: Tuple of metric functions
+        output_type: 'pointer' or 'node_mask'
+    Returns:
+        Dictionary of metric scores
+    """
+    scores = defaultdict(float)
+    for batch_idx, graph in enumerate(data.to_data_list()):
+        batch_pred_idx = (
+            data.batch[data.edge_index[0]]
+            if output_type == "pointer"
+            else data.batch
+        )
+        prediction = batched_prediction[batch_pred_idx == batch_idx]
 
-def evaluate(model, dataloader, calculators):
+        for calculator in calculators:
+            value = calculator(graph, prediction)
+            scores[calculator.__name__] += (
+                value if isinstance(value, float) else value.item()
+            )
+    return scores
+
+def evaluate(model, dataloader, calculators) -> tuple[Dict[str, float], float]:    
+    """
+    Evaluate the model on a dataset.
+
+    Args:
+        model: The trained model to evaluate
+        dataloader: DataLoader with evaluation data
+        calculators: Tuple of metric functions to compute
+    Returns:
+        Tuple of (scores dict, average loss)
+    """
     scores = defaultdict(float)
     total_points = 0
+    total_loss = 0.0
     device = model.parameters().__next__().device
+
     for data in dataloader:
         data = data.to(device)
-        batched_prediction, _ = model(data)
-        for batch_idx, graph in enumerate(data.to_data_list()):
-            batch_pred_idx = (
-                data.batch[data.edge_index[0]]
-                if model.output_type == "pointer"
-                else data.batch
-            )
-            prediction = batched_prediction[batch_pred_idx == batch_idx]
-
-            for calculator in calculators:
-                value = calculator(graph, prediction)
-                scores[calculator.__name__] += (
-                    value if isinstance(value, float) else value.item()
-                )
-            total_points += 1
+        batched_prediction, batched_loss = model(data, training_step=-1)
+        data_list = data.to_data_list()
+        total_loss += batched_loss.detach().item() * len(data_list)
+        total_points += len(data_list)
+        # print(len(data_list))
+        score_batch = score(data, batched_prediction, calculators, model.output_type)
+        for calculator in calculators:
+            scores[calculator.__name__] += score_batch[calculator.__name__]
+        
     for calculator in calculators:
         scores[calculator.__name__] /= total_points
 
-    return scores
+
+    return scores, total_loss / len(dataloader)
 
 
 def evaluate_multitask(model, dataloader, calculators, algorithm: str):
@@ -145,29 +180,25 @@ def evaluate_multitask(model, dataloader, calculators, algorithm: str):
     """
     scores = defaultdict(float)
     total_points = 0
+    total_loss = 0.0
     device = model.parameters().__next__().device
     for data in dataloader:
         data = data.to(device)
         # Pass the algorithm to use correct encoder/decoder components
-        batched_prediction, _ = model(data, multitask_algorithm=algorithm)
-        for batch_idx, graph in enumerate(data.to_data_list()):
-            batch_pred_idx = (
-                data.batch[data.edge_index[0]]
-                if model.output_type == "pointer"
-                else data.batch
-            )
-            prediction = batched_prediction[batch_pred_idx == batch_idx]
+        batched_prediction, batched_loss = model(data, multitask_algorithm=algorithm, training_step=-1)
+        
+        data_list = data.to_data_list()
+        total_loss += batched_loss.detach().item()
+        total_points += len(data_list)
+        score_batch = score(data, batched_prediction, calculators, model.output_type)
 
-            for calculator in calculators:
-                value = calculator(graph, prediction)
-                scores[calculator.__name__] += (
-                    value if isinstance(value, float) else value.item()
-                )
-            total_points += 1
+        for calculator in calculators:
+            scores[calculator.__name__] += score_batch[calculator.__name__]
+
     for calculator in calculators:
         scores[calculator.__name__] /= total_points
 
-    return scores
+    return scores, total_loss / len(dataloader)
 
 #evaluates but also prints the predicted pointer structure and the true output structure for reference 
 def evaluate_print(model, dataloader, calculators, output_path="evaluation_results.json", 
@@ -203,9 +234,9 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
         data = data.to(device)
         # Support multitask by passing algorithm if provided
         if algorithm is not None:
-            batched_prediction, _ = model(data, multitask_algorithm=algorithm)
+            batched_prediction, loss = model(data, multitask_algorithm=algorithm)
         else:
-            batched_prediction, _ = model(data)
+            batched_prediction, loss = model(data)
         
         for batch_idx, graph in enumerate(data.to_data_list()):
             batch_pred_idx = (
@@ -292,6 +323,7 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
                 "pointer_mistakes": graph_mistakes,
                 "is_correct": is_correct,
                 "metrics": graph_metrics,
+                "loss": loss.detach().item(),
             }
             
             # Add edge_index for reference
@@ -319,6 +351,7 @@ def evaluate_print(model, dataloader, calculators, output_path="evaluation_resul
             "mistake_rate": total_pointer_mistakes / total_pointers if total_pointers > 0 else 0.0,
             "correct_graphs": correct_graphs,
             "incorrect_graphs": total_points - correct_graphs,
+            "average_loss": sum(graph["loss"] for graph in graph_results.values()) / len(dataloader) if total_points > 0 else 0.0,
         },
         "metrics": dict(scores),
         "graphs": graph_results,
@@ -958,6 +991,7 @@ class TrainingSession:
     def check_early_stopping(self, current_val_score: float) -> bool:
         """
         Updates patience state. Returns True if training should stop.
+        Currently set to only stop early on repeated perfect validation score.
         """
         best_score = self.state.get("best_val_score", -1.0)
         
@@ -968,7 +1002,7 @@ class TrainingSession:
             self.state["patience_counter"] = 0
             print(f"  > New best val score: {current_val_score:.4f}")
         else:
-            self.state["patience_counter"] = self.state.get("patience_counter", 0) + 1
+            self.state["patience_counter"] = self.state.get("patience_counter", 0) + 1 if best_score==1.0 else 0 #reset if not perfect, as we want to continue training if not perfect until we run out of time
             print(f"  > No improvement. Patience: {self.state['patience_counter']}/{self.patience} (Best: {best_score:.4f})")
         
         # Save state immediately to persist counter across restarts
@@ -1048,7 +1082,165 @@ class TrainingSession:
     def cleanup(self):
         """Clean up temporary files after successful completion."""
         if self.state_file.exists():
-            self.state_file.unlink()
+            config = base_config.Config(self.config_path)
+            #put it into the output directory instead of deleting
+            output_dir = Path(config.out_directory)
+            archived_state_file = output_dir / f"archived/{self.state_file.name}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Archiving state file to: {archived_state_file}")
+            #wait for the dir to exist:
+            archived_state_file.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(self.state_file), str(archived_state_file))
+
+    @staticmethod
+    @overload
+    def resurrect(config_path:str, seed:int, temp_dir:str=None) -> 'TrainingSession': ...
+    @staticmethod
+    @overload
+    def resurrect(archived_path:str|Path) -> 'TrainingSession': ...
+    @staticmethod
+    def resurrect(*args, **kwargs) -> 'TrainingSession':
+        """Resurrect a TrainingSession from existing state, useful for when it stopped but shouldn't have."""
+        
+        #get args
+        archived_path = None
+        if len(args) == 2:
+            config_path = args[0]
+            seed = args[1]
+            temp_dir = kwargs.get('temp_dir', None)
+        elif len(args) == 1:
+            archived_path = Path(args[0])
+
+        if archived_path is not None:
+            #load state from archived path
+            with open(archived_path, 'r') as f:
+                state = json.load(f)
+            config_path = state['config_path']
+            seed = state['seed']
+            temp_dir = kwargs.get('temp_dir', None)
+            session = TrainingSession(config_path, seed, temp_dir=temp_dir)
+            session.state = state
+            #set the completed flag to false
+            session.state['completed'] = False
+            print(f"Resurrected training session from archived state: {archived_path}.\nReady to resume from step {session.get_resume_step()}.")
+            return session
+        
+        else:#we need to resurrect from config and seed
+            # 1. Setup paths
+            if temp_dir is None:
+                user = os.environ.get('USER', 'default')
+                temp_dir = Path(f"/tmp/{user}/experiments")
+            else:
+                temp_dir = Path(temp_dir)
+            
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 2. Load Config to find model name and algorithms
+            print(f"Loading config: {config_path}")
+            base_cfg = base_config.read_config(config_path)
+            
+            algorithms = []
+            is_multitask = False
+            
+            if hasattr(base_cfg, 'multitask_algorithms') and base_cfg.multitask_algorithms:
+                is_multitask = True
+                algorithms_session = sorted(base_cfg.multitask_algorithms) # Sort for consistent naming
+                algorithms = base_cfg.multitask_algorithms# use the original order
+                algo_str_session = "_".join(algorithms_session)
+                algo_str_checkpoint = "_".join(algorithms)
+                model_name = f"multitask_{algo_str_checkpoint}_{seed}"
+                config_name = Path(config_path).stem
+                session_id = f"{config_name}_multitask_{algo_str_session}_seed{seed}"
+            else:
+                model_name = f"{base_cfg.algorithm}_{seed}"
+                config_name = Path(config_path).stem
+                session_id = f"{config_name}_{base_cfg.algorithm}_seed{seed}"
+            print(f"Target Session ID: {session_id}")
+            
+            # 3. Find Checkpoints
+            checkpoint_dir = Path(base_cfg.out_directory).parent / "out" / f"checkpoints_{model_name}"
+            # Note: Adjust 'out' if your config uses a different base output directory
+            if not checkpoint_dir.exists():
+                # Try local models dir as fallback
+                checkpoint_dir = Path(base_cfg.out_directory) / f"checkpoints_{model_name}"
+            
+            if not checkpoint_dir.exists():
+                print(f"Error: Could not find checkpoint directory at: {checkpoint_dir}")
+                print("Please check where your checkpoints are saved (config.out_directory).")
+                exit(1)
+
+            # Find latest checkpoint (.pt file)
+            checkpoints = list(checkpoint_dir.glob("*.pt"))
+            if not checkpoints:
+                print("Error: No .pt files found in checkpoint directory.")
+                exit(1)
+
+            # Helper to get step from filename or load file
+            def get_step(p):
+                if "final" in p.name:
+                    # Load file to get exact step
+                    try:
+                        state = torch.load(p, map_location='cpu')
+                        return state.get('step', 999999999)
+                    except:
+                        return 0
+                # Parse "model_step_12345.pt"
+                parts = p.stem.split('_')
+                for part in parts:
+                    if part.isdigit():
+                        return int(part)
+                return 0
+
+            latest_ckpt = max(checkpoints, key=get_step)
+            current_step = get_step(latest_ckpt)
+
+            if 'final' in latest_ckpt.name:
+                #get the step counter from the training_summary.json if available
+                summary_file = checkpoint_dir / f"training_summary.json"
+                if summary_file.exists():
+                    with open(summary_file, 'r') as f:
+                        summary = json.load(f)
+                    if is_multitask:
+                        steps_per_alg = summary.get('steps_per_algorithm', {})
+                        current_step = sum(steps_per_alg.get(alg, 0) for alg in algorithms)
+                    else:
+                        current_step = summary.get('total_steps', current_step)
+            
+            print(f"Found latest checkpoint: {latest_ckpt.name} (Step {current_step})")
+
+            # 4. Reconstruct State
+            # For multitask, we need to estimate steps_per_algorithm
+            steps_per_alg = {}
+            if is_multitask:
+                # Assuming synchronized training, each alg is roughly at total_step / num_algs
+                val = current_step // len(algorithms)
+                steps_per_alg = {alg: val for alg in algorithms}
+            
+            state = {
+                "config_path": config_path,
+                "seed": seed,
+                "multitask": is_multitask,
+                "algorithms": algorithms,
+                "current_step": current_step,
+                "steps_per_algorithm": steps_per_alg,
+                "completed": False,  # <--- CRITICAL: Resurrect job
+                "restarts": 1e4,  # High number to indicate resurrected job
+                "total_runtime": 0.0,
+                "last_checkpoint": str(latest_ckpt.absolute()),
+                "wandb_run_id": model_name, # Try to reconnect to legacy/named run
+                "best_val_score": -1.0, # Reset so it doesn't stop immediately if score dropped slightly
+                "patience_counter": 0   # <--- CRITICAL: Reset patience
+            }
+
+            # 5. Save State File
+            state_file = temp_dir / f"training_state_{session_id}.json"
+            with open(state_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            print(f"Successfully reconstructed state file: {state_file}")
+            print(f"You can now run: python train.py --restart --patience 100")
+
+
 
 
 class RestartManager:
@@ -1074,7 +1266,7 @@ class RestartManager:
         
         return incomplete
     
-    def get_next_job(self, filter:str=None) -> Optional[Dict[str, Any]]:
+    def get_next_job(self, filter:str=None, force:bool=False, seed:int=None) -> Optional[Dict[str, Any]]:
         """Get next incomplete job to restart."""
         jobs = self.find_incomplete_jobs()
         if not jobs:
@@ -1083,7 +1275,7 @@ class RestartManager:
         if filter:#filer is the config path
             for job in jobs:
                 print(f"'{job['config_path']}'", type(job['config_path']))
-            jobs = [job for job in jobs if filter in job['config_path']]
+            jobs = [job for job in jobs if filter in job['config_path']] 
         
         # Sort by current step (resume furthest progress first)
         jobs.sort(key=lambda x: x.get("current_step", 0), reverse=True)
@@ -1094,17 +1286,20 @@ class RestartManager:
         available_jobs = []
         
         for job in jobs:
+            if seed is not None and job['seed'] != seed:
+                print(f"Skipping job '{job['config_path']}' (seed {job['seed']} does not match filter {seed})")
+                continue
             # If job was restarted in the last 60 seconds, skip it
             # (another process is likely working on it)
             last_restart_time = job.get('last_restart_time', 0)
-            if current_time - last_restart_time > 1200: #don't choose probably running jobs
+            if force or current_time - last_restart_time > 1200: #don't choose probably running jobs
                 available_jobs.append(job)
             else:
                 print(f"Skipping job '{job['config_path']}' (recently restarted)")
         
         return available_jobs[0] if available_jobs else None
 
-    def get_next_jobs(self, num_jobs: int, filter:str=None) -> list[Dict[str, Any]]:
+    def get_next_jobs(self, num_jobs: int, filter:str=None, force:bool=False) -> list[Dict[str, Any]]:
         """Get up to N incomplete jobs to restart."""
         jobs = self.find_incomplete_jobs()
         if not jobs:
@@ -1122,7 +1317,7 @@ class RestartManager:
         
         for job in jobs:
             last_restart_time = job.get('last_restart_time', 0)
-            if current_time - last_restart_time > 1800: #don't choose probably running jobs
+            if force or current_time - last_restart_time > 1800: #don't choose probably running jobs
                 available_jobs.append(job)
                 if len(available_jobs) >= num_jobs:
                     break
@@ -1148,7 +1343,7 @@ class RestartManager:
                 print(f"   Checkpoint: {job['last_checkpoint']}")
         print("-" * 80)
     
-    def clean_all_jobs(self) -> int:
+    def clean_all_jobs(self, except_substring: Optional[str] = None) -> int:
         """Clean up all incomplete training job state files. Returns count of cleaned jobs."""
         state_files = list(self.temp_dir.glob("training_state_*.json"))
         
@@ -1157,6 +1352,9 @@ class RestartManager:
         
         print(f"\nCleaning {len(state_files)} job state file(s)...")
         for state_file in state_files:
+            if except_substring and except_substring in state_file.name:
+                print(f"  Skipping: {state_file.name}, it contains '{except_substring}'")
+                continue
             print(f"  Removing: {state_file.name}")
             state_file.unlink()
         
@@ -1167,11 +1365,15 @@ class RestartManager:
         state_file = self.temp_dir / f"training_state_{session_id}.json"
         
         if not state_file.exists():
+            print(f"State file not found: {state_file}")
+            print("Available state files:")
+            self.list_jobs()
             return False
         
         print(f"Removing state file: {state_file}")
         state_file.unlink()
         return True
+    
     
     def _get_session_id_from_job(self, job: Dict[str, Any]) -> str:
         """Extract session ID from job state."""
@@ -1301,6 +1503,8 @@ def get_least_used_gpus() -> list[int]:
     Get list of GPU IDs sorted by usage (least used first).
     Falls back to all GPUs if nvidia-smi is not available.
     """
+    preferences= [3, 8, 40, 6]
+
     try:
         import subprocess
         # Get GPU memory usage using nvidia-smi
@@ -1332,7 +1536,7 @@ def get_least_used_gpus() -> list[int]:
                         gpu_util = int(gpu_util_str)
                     
                     # Combined score: prioritize low memory usage, then low GPU util
-                    score = mem_used * 0.7 + gpu_util * 0.3
+                    score = mem_used * 0.7 + gpu_util * 0.3 
                     gpu_stats.append((gpu_id, score, mem_used, gpu_util))
                 except (ValueError, IndexError) as e:
                     print(f"Warning: Could not parse GPU line '{line}': {e}")
@@ -1343,8 +1547,9 @@ def get_least_used_gpus() -> list[int]:
             return list(range(torch.cuda.device_count()))
         
         # Sort by score (lowest first)
+        gpu_stats = [(gpu_id, score*preferences[gpu_id], mem_used, gpu_util) for gpu_id, score, mem_used, gpu_util in gpu_stats]
         gpu_stats.sort(key=lambda x: x[1])
-        sorted_gpus = [gpu_id for gpu_id, score, _, _ in gpu_stats if score < 1e4]  # Filter out very high usage GPUs
+        sorted_gpus = [gpu_id for gpu_id, score, _, _ in gpu_stats if score < 1e5]  # Filter out very high usage GPUs
         
         print(f"GPU usage (sorted by availability):")
         for gpu_id, score, mem_used, gpu_util in gpu_stats:
@@ -1370,3 +1575,34 @@ def get_gpus(int: int) -> list[int]:
     selected_gpus = available_gpus[:int]
     print(f"Selected GPUs: {selected_gpus}")
     return selected_gpus
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Restart Manager Utility")
+    parser.add_argument('--list', action='store_true', help="List incomplete training jobs")
+    parser.add_argument('--clean-all', action='store_true', help="Clean all incomplete training job state files")
+    parser.add_argument('--clean', type=str, help="Clean specific job by session ID")
+    parser.add_argument('--filter', type=str, help="Filter jobs by config path substring")
+    parser.add_argument('--num-jobs', type=int, default=1, help="Number of jobs to list")
+    parser.add_argument('--resurrect', action='store_true', help="Resurrect a training session from config and seed")
+    parser.add_argument('--config_path', type=str, help="Path to config file for resurrection")
+    parser.add_argument('--seed', type=int, help="Random seed for resurrection")
+    args = parser.parse_args()
+
+    manager = RestartManager()
+
+    if args.list:
+        manager.list_jobs()
+    elif args.clean_all:
+        count = manager.clean_all_jobs()
+        print(f"Cleaned {count} job(s).")
+    elif args.clean:
+        success = manager.clean_job(args.clean)
+        if success:
+            print(f"Cleaned job with session ID: {args.clean}")
+        else:
+            print(f"No job found with session ID: {args.clean}")
+    elif args.resurrect:
+        if not args.config_path or args.seed is None:
+            print("Error: --config-path and --seed are required for resurrection.")
+            exit(1)
+        TrainingSession.resurrect(args.config_path, args.seed)

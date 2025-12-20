@@ -16,7 +16,7 @@ class Config:
     learning_rate: float = 0.0001
     weight_decay: float = 0.0
     num_iterations: int = 10000
-    min_iterations: int = 2000 #do at least this before checking early stopping
+    min_iterations: int = 1000 #do at least this before checking early stopping
     eval_each: int = 100 #eval and for early stopping
     stepwise_training: bool = True #whether to use teacher forcing
     processor_upper_t: float = 3. #gumbel annealing temperature start
@@ -33,7 +33,7 @@ class Config:
     # --- model ---
     h: int = 128
     temp_on_eval: float = 0.
-    checkpoint_interval: float = 0.1 # Fraction of total steps between checkpoints and print evals
+    checkpoint_interval: float = 0.05 # Fraction of total steps between checkpoints and print evals
 
     num_node_states: int = 1
     num_edge_states: int = 1
@@ -59,7 +59,7 @@ class Config:
     out_directory: str = 'out'
     tensorboard_logs: bool = True
     wandb_logs: bool = True
-    wandb_project: str = 'dnar'
+    project: str = 'dnar_single'
     wandb_entity: Optional[str] = None  # Your wandb username or team name
 
 

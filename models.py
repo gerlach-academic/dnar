@@ -1,6 +1,7 @@
 from typing import Optional, overload
 
 from torch.nn import Module
+import torch
 
 from configs import base_config
 from processors import DiscreteProcessor
@@ -56,7 +57,7 @@ class Dnar(Module):
         T = batch.node_fts.shape[1]
         batch.batched_reverse_idx = reverse_edge_index(batch.edge_index)
 
-        loss = 0.0
+        loss = torch.tensor(0., device=batch.node_fts.device)
 
         node_states = batch.node_fts[:, 0]
         edge_states = batch.edge_fts[:, 0]
@@ -77,6 +78,4 @@ class Dnar(Module):
         states = edge_states if self.output_type == "pointer" else node_states
         output = states[:, self.output_idx]
 
-        if writer is not None:
-            writer.add_scalar("Loss/train", loss.detach().item(), training_step)
         return output, loss

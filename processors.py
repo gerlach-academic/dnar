@@ -203,8 +203,8 @@ class ScalarUpdater(torch.nn.Module):
 
         loss = (
             ((batch.scalars[:, processor_step] - new_scalars) ** 2).mean()
-            if training_step != -1
-            else 0.0
+            # if training_step != -1 #enable loss only during training
+            # else 0.0
         )
 
         if teacher_force:
@@ -298,19 +298,19 @@ class StatesBottleneck(torch.nn.Module):
                 gt = hints[:, idx].double() #select the hint to be projected into
 
                 # loss
-                if training_step != -1:
-                    if self.spec[group][idx] != MASK:
-                        index = batch.batch if group == 0 else batch.edge_index[0]
-                        weight = 1
-                        if self.spec[group][idx] == EDGE_MASK_ONE:
-                            index = batch.batch[batch.edge_index[0]]
-                            num_nodes = (batch.batch == 0).sum()
-                            weight = num_nodes
-                        ce_loss = weight * node_pointer_loss(logits, gt, index)
-                    else:
-                        ce_loss = binary_cross_entropy_with_logits(logits, gt)
+                # if training_step != -1: #enable loss only during training
+                if self.spec[group][idx] != MASK:
+                    index = batch.batch if group == 0 else batch.edge_index[0]
+                    weight = 1
+                    if self.spec[group][idx] == EDGE_MASK_ONE:
+                        index = batch.batch[batch.edge_index[0]]
+                        num_nodes = (batch.batch == 0).sum()
+                        weight = num_nodes
+                    ce_loss = weight * node_pointer_loss(logits, gt, index)
+                else:
+                    ce_loss = binary_cross_entropy_with_logits(logits, gt)
 
-                    loss += ce_loss
+                loss += ce_loss
 
                 # postprocess
                 if not teacher_force: #if not forced, we use the model's own predictions for the next step

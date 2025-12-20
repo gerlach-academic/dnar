@@ -33,9 +33,15 @@ class DualLogger:
         self.tb_writer = tb_writer
         self.wandb_writer = wandb_writer
         self.use_wandb = (wandb_writer is not None) and WANDB_AVAILABLE
+        #  we hold an internal step and only log the old step when step gets increment
+        #  this avoids issues with wandbb auto incrementing step on each log call
+        self.wandb_current_step = 0
+        self.wandb_log_metrics_buffer = {}
 
     def add_scalar(self, tag: str, scalar_value, global_step: int):
-        """Log a scalar value to both TensorBoard and wandb."""
+        """Log a scalar value to both TensorBoard and wandb.
+        DEPRECATED: Please use log_dict instead, as add_scalar is not compatible with wandb's auto step increment.
+        """
 
         if self.tb_writer is not None:
             if isinstance(scalar_value, dict):
@@ -47,18 +53,19 @@ class DualLogger:
         if self.use_wandb:
             # Note: This might increment the internal step if called repeatedly.
             # Use log_dict for atomic multi-metric logging.
-            if self.wandb_writer is not None and global_step <= self.wandb_writer.step:
+            if global_step < self.wandb_writer.step:
                 if not getattr(self, "_wandb_ahead_warning_shown", False):
                     print(f"Warning: WandB is ahead (step {self.wandb_writer.step}) of local (step {global_step}). "
                             "Skipping redundant logs until caught up.")
                     self._wandb_ahead_warning_shown = True
                 return
-            try:
+
+            try: #log one step in the future bc wandb starts with 1
                 if isinstance(scalar_value, dict):
                     log_dict = {f"{tag}/{k}": v for k, v in scalar_value.items()}
-                    self.wandb_writer.log(log_dict, step=global_step)
+                    self.wandb_writer.log(log_dict, step=global_step+1)
                 else:
-                    self.wandb_writer.log({tag: scalar_value}, step=global_step)
+                    self.wandb_writer.log({tag: scalar_value}, step=global_step+1)
             except Exception as e:
                 print(f"Warning: wandb log failed for {tag}: {e}")
 
@@ -74,25 +81,40 @@ class DualLogger:
                         self.tb_writer.add_scalar(f"{tag}/{k}", v, step)
                 else:
                     self.tb_writer.add_scalar(tag, value, step)
+        
         if self.use_wandb:
-            if self.wandb_writer is not None and step <= self.wandb_writer.step:
+            if self.wandb_writer is not None and step < self.wandb_writer.step:
                 if not getattr(self, "_wandb_ahead_warning_shown", False):
                     print(f"Warning: WandB history (step {self.wandb_writer.step}) is ahead of local training (step {step}). "
                             "Skipping upload of replayed steps.")
-                    self._wandb_ahead_warning_shown = True
+                    self._wandb_ahead_warning_shown = True #debug print always
                 return
-            try:
-                #unify the double dict case
-                log_dict = {}
-                for tag, value in metrics.items():
-                    if isinstance(value, dict):
-                        for k, v in value.items():
-                            log_dict[f"{tag}/{k}"] = v
-                    else:
-                        log_dict[tag] = value
-                self.wandb_writer.log(log_dict, step=step)
-            except Exception as e:
-                print(f"Warning: wandb log_dict failed: {e}")
+
+            if step > self.wandb_current_step:
+                try: 
+                    # Flush any buffered metrics at the old step
+                    if self.wandb_log_metrics_buffer:
+                        try:
+                            self.wandb_writer.log(self.wandb_log_metrics_buffer, step=self.wandb_current_step)
+                        except Exception as e:
+                            print(f"Warning: wandb log_dict failed during flush: {e}")
+                        self.wandb_log_metrics_buffer = {}
+                    self.wandb_current_step = step
+                except Exception as e:
+                    print(f"Warning: wandb log_dict failed to update step: {e}")
+            
+            #log to buffer
+            #unify the double dict case
+            log_dict = {}
+            for tag, value in metrics.items():
+                if isinstance(value, dict):
+                    for k, v in value.items():
+                        log_dict[f"{tag}/{k}"] = v
+                else:
+                    log_dict[tag] = value
+
+            self.wandb_log_metrics_buffer.update(log_dict)
+
 
     def close(self):
         """Close the loggers."""
@@ -102,6 +124,14 @@ class DualLogger:
             except Exception:
                 pass
         if self.use_wandb and self.wandb_writer is not None:
+            #flush remaining wandb buffer
+            if self.wandb_log_metrics_buffer:
+                try:
+                    self.wandb_writer.log(self.wandb_log_metrics_buffer, step=self.wandb_current_step)
+                except Exception as e:
+                    print(f"Warning: wandb log_dict failed during final flush: {e}")
+                self.wandb_log_metrics_buffer = {}
+
             try:
                 if getattr(self.wandb_writer, "finish", None) is not None:
                     self.wandb_writer.finish()
@@ -124,7 +154,7 @@ def create_logger(config: base_config.Config, run_name: str, wandb_run_id: Optio
     use_wandb = False
 
     if config.tensorboard_logs:
-        tb_writer = SummaryWriter(comment=f"-{run_name}")
+        tb_writer = SummaryWriter(log_dir=Path("runs")/config.project, comment=f"-{run_name}")
 
     if config.wandb_logs:
         if not WANDB_AVAILABLE:
@@ -138,7 +168,7 @@ def create_logger(config: base_config.Config, run_name: str, wandb_run_id: Optio
                 else:
                     # Use explicit id + resume to make behavior deterministic across restarts
                     wandb_writer = wandb.init(
-                        project=config.wandb_project,
+                        project=config.project,
                         entity=config.wandb_entity,
                         name=run_name,
                         id=run_id,
@@ -156,6 +186,7 @@ def create_logger(config: base_config.Config, run_name: str, wandb_run_id: Optio
                             "stepwise_training": config.stepwise_training,
                             "multitask_algorithms": getattr(config, "multitask_algorithms", None),
                         },
+                        settings=wandb.Settings(init_timeout=30),
                         # Do NOT use reinit=True here; we control init explicitly.
                     )
                 use_wandb = True
@@ -180,27 +211,35 @@ def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, step
     with torch.no_grad():
         model.eval()
         if algorithm:
-            val_scores = utils.evaluate_multitask(model, val_data, metrics_list, algorithm)
-            test_scores = utils.evaluate_multitask(model, test_data, metrics_list, algorithm)
+            val_scores, val_loss = utils.evaluate_multitask(model, val_data, metrics_list, algorithm)
+            test_scores, test_loss = utils.evaluate_multitask(model, test_data, metrics_list, algorithm)
             print(f"Eval after {steps} steps [{algorithm}]:")
         else:
-            val_scores = utils.evaluate(model, val_data, metrics_list)
-            test_scores = utils.evaluate(model, test_data, metrics_list)
+            val_scores, val_loss = utils.evaluate(model, val_data, metrics_list)
+            test_scores, test_loss = utils.evaluate(model, test_data, metrics_list)
             print("Eval after {} steps:".format(steps))
-        print("Val scores: ", val_scores)
-        print("Test scores: ", test_scores)
+        print("Val scores: ", val_scores, f" (Loss: {val_loss:.4f})")
+        print("Test scores: ", test_scores, f" (Loss: {test_loss:.4f})")
         model.train()
     
     # If a writer is provided (Single Task), log immediately.
-    # For Multitask, we pass writer=None and handle logging in the loop buffer.
+    # For Multitask (algorithm none), we pass writer=None and handle logging in the loop buffer.
     if writer is not None:
         prefix = f"{algorithm}/" if algorithm else ""
+        metrics = {}
         for stat in val_scores:
-            writer.add_scalar(f"{prefix}{stat}/val", val_scores[stat], steps)
-            writer.add_scalar(f"{prefix}{stat}/test", test_scores[stat], steps)
+            metrics[f"Val/{prefix}{stat}"] = val_scores[stat]
+            metrics[f"Test/{prefix}{stat}"] = test_scores[stat]
+        metrics[f"Val/{prefix}loss"] = val_loss
+        metrics[f"Test/{prefix}loss"] = test_loss
+        writer.log_dict(metrics, steps)
+
+    else:
+        print(f"Writer is None and algorithm is {algorithm}. Current Step: {steps}!")
+
     model_saver.visit(model, val_scores)
 
-    return val_scores, test_scores
+    return val_scores, test_scores, val_loss, test_loss
 
 def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
     device = torch.device(
@@ -264,7 +303,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
     print(f"  Iterations: {config.num_iterations}")
     print(f"  Resume from: {resume_from_step}")
     if checkpoint_interval > 0:
-        print(f"  Checkpoints every {checkpoint_interval} steps ({config.checkpoint_interval} checkpoints total)")
+        print(f"  Checkpoints every {checkpoint_interval} steps ({1/config.checkpoint_interval} checkpoints total)")
         print(f"  Checkpoint dir: {checkpoint_dir}")
     if session:
         print(f"  Max runtime: {session.max_runtime_seconds}s")
@@ -298,7 +337,15 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
 
             batch = batch.to(device)
 
-            _, loss = model(batch, writer, training_step=steps)
+            batch_result, loss = model(batch, writer, training_step=steps)
+            #score the train batch
+            batch_length = len(batch.to_data_list())
+            bacth_loss = loss.detach().item()
+            batch_score = utils.score(batch, batch_result, utils.METRICS[config.output_type], config.output_type)
+
+            if writer is not None:
+                writer.log_dict({f"Train/{k}": v/batch_length for k, v in batch_score.items()} | {"Train/loss": bacth_loss}, steps)
+
             assert not torch.isnan(loss)
 
             loss.backward()
@@ -307,7 +354,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
             opt.zero_grad()
 
             if steps % config.eval_each == 1:
-                val_scores, test_scores = evaluate(
+                val_scores, _, _, _ = evaluate(
                     model,
                     val_data,
                     test_data,
@@ -531,7 +578,7 @@ def configs_from_multitask_config(config: base_config.Config) -> List[base_confi
             models_directory=config.models_directory,
             tensorboard_logs=config.tensorboard_logs,
             wandb_logs=config.wandb_logs,
-            wandb_project=config.wandb_project,
+            project=config.project,
             wandb_entity=config.wandb_entity,
         )
         configs.append(algo_config)
@@ -591,7 +638,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         models_directory=configs[0].models_directory,
         tensorboard_logs=configs[0].tensorboard_logs,
         wandb_logs=getattr(configs[0], 'wandb_logs', False),
-        wandb_project=getattr(configs[0], 'wandb_project', 'dnar'),
+        project=getattr(configs[0], 'project', 'dnar'),
         wandb_entity=getattr(configs[0], 'wandb_entity', None),
         multitask_num_algorithms=len(configs),
         multitask_algorithms=algorithms,
@@ -680,7 +727,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
     print(f"  - {unified_config.num_iterations} iterations per algorithm")
     print(f"  - {total_steps} total steps (interleaved)")
     if checkpoint_interval > 0:
-        print(f"  - Checkpoints every {checkpoint_interval} steps")
+        print(f"  - Checkpoints every {checkpoint_interval} steps, total of {1/checkpoint_interval} checkpoints")
     if session:
         print(f"  - Max runtime: {session.max_runtime_seconds}s")
         print(f"  - Restarts so far: {session.state.get('restarts', 0)}")
@@ -736,18 +783,25 @@ def train_multitask(configs: List[base_config.Config], seed: int,
             steps_per_algorithm[algorithm] += 1
             
             # Forward pass with algorithm-specific components
-            _, loss = model(batch, writer, training_step=steps_per_algorithm[algorithm], multitask_algorithm=algorithm)
-            
-            if torch.isnan(loss):
+            batch_result, batch_loss = model(batch, writer, training_step=steps_per_algorithm[algorithm], multitask_algorithm=algorithm)
+
+            if torch.isnan(batch_loss):
                 raise ValueError(f"NaN loss at step {steps} for algorithm {algorithm}")
 
-            loss.backward()
+            batch_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             opt.zero_grad()
-            
+
+            batch_length = len(batch.to_data_list())
+            batch_loss = batch_loss
+            batch_score = utils.score(batch, batch_result, utils.METRICS[unified_config.output_type], unified_config.output_type)
+            # Buffer train metrics
+            round_metrics_buffer.update({f"Train/{algorithm}/{k}": v/batch_length for k, v in batch_score.items()})
             # buffer loss per algorithm
-            round_metrics_buffer[f"{algorithm}/Loss/train"] = loss.detach().item()
+            round_metrics_buffer[f"Train/{algorithm}/loss"] = batch_loss.detach().item()
+            
+            
             # Evaluate periodically
             if steps_per_algorithm[algorithm] % unified_config.eval_each == 1:
                 val_scores, test_scores = evaluate(
@@ -762,9 +816,9 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                 )
                 # Buffer the scores
                 for k, v in val_scores.items():
-                    round_metrics_buffer[f"{algorithm}/{k}/val"] = v
+                    round_metrics_buffer[f"Val/{algorithm}/{k}"] = v
                 for k, v in test_scores.items():
-                    round_metrics_buffer[f"{algorithm}/{k}/test"] = v
+                    round_metrics_buffer[f"Test/{algorithm}/{k}"] = v
             
             # Progress logging
             if steps % (100 * len(algorithms)) == 0:
@@ -835,15 +889,15 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         # --- EARLY STOPPING CHECK ---
         #if done at least min_iterations
         # Only check if we actually evaluated this round (look for keys in buffer)
-        if session and any("/val" in k for k in round_metrics_buffer):
+        if session and any("Val/" in k for k in round_metrics_buffer):
             # Determine metric name based on output type
             metric_name = "pointer_accuracy_graph_level" if unified_config.output_type == "pointer" else "node_mask_accuracy_graph_level"
             
             # Extract scores for this specific metric across all algorithms
-            # Key format: "{algorithm}/{metric_name}/val"
+            # Key format: "Val/{algorithm}/{metric_name}"
             val_accs = []
             for k, v in round_metrics_buffer.items():
-                if k.endswith(f"/{metric_name}/val"):
+                if k.endswith(f"Val//{metric_name}"):
                     val_accs.append(v)
             
             if val_accs:
@@ -1101,6 +1155,12 @@ def train_worker(args):
         patience=patience,
     )
 
+     # Check if session found previous state
+    if session.get_resume_step() == 0:
+        print(f"[Worker {seed}] Warning: Session started at step 0. State file not found or empty?")
+    else:
+        print(f"[Worker {seed}] Resuming from step {session.get_resume_step()}")
+
     # --- Training ---
     if multitask:
         model = train_multitask(configs, seed, session=session, gpu_id=gpu_id)
@@ -1127,7 +1187,7 @@ if __name__ == "__main__":
                         help="Path to config file. For multitask, can be: "
                              "1) A single config with 'multitask_algorithms' list, or "
                              "2) Comma-separated paths to multiple config files")
-    parser.add_argument("--num_seeds", type=int, default=3, help="Number of random seeds to train, If set on restart this many seeds will be checked for incomplete jobs.")
+    parser.add_argument("--num_seeds", type=int, default=1, help="Number of random seeds to train, If set on restart this many seeds will be checked for incomplete jobs.")
     parser.add_argument("--seed_start", type=int, default=42, help="Starting seed value (default: 42)")
     parser.add_argument("--multitask", action="store_true",
                         help="Enable multitask training")
@@ -1143,12 +1203,18 @@ if __name__ == "__main__":
                         help="List all incomplete training jobs")
     parser.add_argument("--clean_jobs", action="store_true",
                         help="Clean up all incomplete training job state files")
+    parser.add_argument("--clean_jobs_except", type=str, default=None,
+                        help="Clean up all incomplete training job state files except those matching the given substring")
     parser.add_argument("--clean_job", type=str, default=None,
                         help="Clean up specific job by session ID (e.g., 'bfs_seed40')")
     parser.add_argument("--max_runtime_minutes", type=int, default=23,
                         help="Maximum runtime per training session in minutes (default: 23)")
     parser.add_argument("--patience", type=int, default=5,
                         help="Early stopping patience in number of evaluations (default: 5)")
+    parser.add_argument("--force", action="store_true", default=False,
+                        help="Force action")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Specific seed to restart (only for non-parallel restarts)")
 
     options = parser.parse_args()
     
@@ -1162,6 +1228,11 @@ if __name__ == "__main__":
     if options.clean_jobs:
         manager = RestartManager()
         manager.clean_all_jobs()
+        exit()
+
+    if options.clean_jobs_except:
+        manager = RestartManager()
+        manager.clean_all_jobs(except_substring=options.clean_jobs_except)
         exit()
     
     if options.clean_job:
@@ -1178,7 +1249,7 @@ if __name__ == "__main__":
 
             manager = RestartManager()
             restart_filter = options.config_path if options.config_path else None
-            jobs = manager.get_next_jobs(num_jobs=num_jobs, filter=restart_filter)
+            jobs = manager.get_next_jobs(num_jobs=num_jobs, filter=restart_filter, force=options.force)
 
             if not jobs:
                 print("No incomplete jobs found.")
@@ -1240,7 +1311,7 @@ if __name__ == "__main__":
         else:
             manager = RestartManager()
             filter = options.config_path if options.config_path else None
-            job = manager.get_next_job(filter=filter)
+            job = manager.get_next_job(filter=filter, force=options.force, seed=options.seed)
             
             if job is None:
                 print("No incomplete jobs found.")
@@ -1264,6 +1335,11 @@ if __name__ == "__main__":
                 algorithms=algorithms,
                 patience=options.patience
             )
+
+            if session.get_resume_step() == 0:
+                print(f"[Worker {job['seed']}] Warning: Session started at step 0. State file not found or empty?")
+            else:
+                print(f"[Worker {job['seed']}] Resuming from step {session.get_resume_step()}")
             
             np.random.seed(job['seed'])
             torch.manual_seed(job['seed'])
