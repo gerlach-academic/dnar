@@ -52,5 +52,5 @@ output_idx: 0
 models_directory: models
 tensorboard_logs: true
 wandb_logs: true  # Set to true to enable Weights & Biases logging
-wandb_project: dnar_multitask  # W&B project name
+project: dnar_multitask  # W&B project name
 # wandb_entity: your_username  # Uncomment and set your W&B username/team
