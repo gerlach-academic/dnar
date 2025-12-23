@@ -21,7 +21,7 @@ class Config:
     stepwise_training: bool = True #whether to use teacher forcing
     processor_upper_t: float = 3. #gumbel annealing temperature start
     processor_lower_t: float = 0.01 #gumbel annealing temperature end
-    use_noise: bool = True #whether to use gumbel noise in the softmaxes
+    use_noise: bool = True #whether to use gumbel noise in the softmaxe
 
     # --- data ---
     num_samples: dict = None
