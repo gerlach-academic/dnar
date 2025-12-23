@@ -1,7 +1,6 @@
-algorithm: dijkstra
+algorithm: mst
 
-# learning_rate: 0.001
-
+learning_rate: 0.001
 # --- data ---
 num_samples:
   train: 10000
@@ -14,6 +13,8 @@ problem_size:
   test: 64
 
 edge_weights: true
+
+project: str = 'dnar_single_large_lr'
 
 # --- model ---
 num_node_states: 2

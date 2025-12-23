@@ -13,7 +13,6 @@ import json
 import time
 from pathlib import Path
 from typing import Optional, List
-from torch_geometric.loader import DataLoader as GeomDataLoader
 
 from configs import base_config
 import argparse
@@ -240,77 +239,6 @@ def mst(instance: ProblemInstance):
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
-
-def dijkstra(instance: ProblemInstance):
-    n = instance.adj.shape[0]
-    node_states = []
-    edge_states = []
-    scalars = []
-
-    in_queue = np.zeros(n, dtype=np.int32)
-    in_tree = np.zeros(n, dtype=np.int32)
-    pointers = np.eye(n, dtype=np.int32)
-    self_loops = np.eye(n, dtype=np.int32)
-
-    node_dist = np.zeros(n, dtype=np.float32) #changed from position to zero, as was not informative anyways
-
-    def compute_current_scalars(dist_vals):
-        # Edge features = Weights. Self-loops = Distance Estimates.
-        s = instance.adj[instance.edge_index[0], instance.edge_index[1]]
-        s[instance.edge_index[0] == instance.edge_index[1]] = dist_vals
-        return s
-
-    in_queue[instance.start] = 1
-    # node_dist[start] is already 0, which is correct for the start node.
-    
-    push_states(
-        node_states, edge_states, scalars,
-        (in_queue, in_tree), (pointers, self_loops),
-        (compute_current_scalars(node_dist),),
-    )
-
-    for _ in range(n):
-        # Priority Queue selection:
-        # Add 1e9 to nodes NOT in queue. This makes them "Infinite" to argsort.
-        candidates = node_dist + (1.0 - in_queue) * 1e9
-        
-        # If min is >= 1e9, queue is empty.
-        if np.min(candidates) >= 1e9: 
-            break
-        
-        node = np.argmin(candidates)
-        
-        in_tree[node] = 1
-        in_queue[node] = 0
-
-        for out in instance.out_nodes[node]:
-            new_dist = node_dist[node] + instance.adj[node][out]
-            
-            # Relax edge
-            # If out is not in tree AND (not in queue OR found a shorter path)
-            if in_tree[out] == 0 and (in_queue[out] == 0 or new_dist < node_dist[out]):
-                pointers[out] = np.zeros(n, dtype=np.int32)
-                pointers[out][node] = 1
-                node_dist[out] = new_dist
-                in_queue[out] = 1
-
-        push_states(
-            node_states, edge_states, scalars,
-            (in_queue, in_tree), (pointers, self_loops),
-            (compute_current_scalars(node_dist),),
-        )
-
-    # Pad trajectory
-    while len(node_states) < n:
-        push_states(
-            node_states, edge_states, scalars,
-            (in_queue, in_tree), (pointers, self_loops),
-            (compute_current_scalars(node_dist),),
-        )
-
-    return np.array(node_states), np.array(edge_states), np.array(scalars)
-
-
 def mis(instance: ProblemInstance):
     # MIS uses randomness, logic mostly independent of position
     n = instance.adj.shape[0]
@@ -379,12 +307,87 @@ def mis(instance: ProblemInstance):
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
+def dijkstra(instance: ProblemInstance):
+    n = instance.adj.shape[0]
+    node_states = []
+    edge_states = []
+    scalars = []
+
+    in_queue = np.zeros(n, dtype=np.int32)
+    in_tree = np.zeros(n, dtype=np.int32)
+    pointers = np.eye(n, dtype=np.int32)
+    self_loops = np.eye(n, dtype=np.int32)
+
+    node_dist = np.zeros(n, dtype=np.float32) #changed from position to zero, as was not informative anyways
+
+    def compute_current_scalars(dist_vals):
+        # Edge features = Weights. Self-loops = Distance Estimates.
+        s = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+        s[instance.edge_index[0] == instance.edge_index[1]] = dist_vals
+        return s
+
+    in_queue[instance.start] = 1
+    # node_dist[start] is already 0, which is correct for the start node.
+    
+    push_states(
+        node_states, edge_states, scalars,
+        (in_queue, in_tree), (pointers, self_loops),
+        (compute_current_scalars(node_dist),),
+    )
+
+    for _ in range(n):
+        # Priority Queue selection:
+        # Add 1e9 to nodes NOT in queue. This makes them "Infinite" to argsort.
+        candidates = node_dist + (1.0 - in_queue) * 1e3
+        
+        # If min is >= 1e9, queue is empty.
+        if np.min(candidates) >= 1e9: 
+            break
+        
+        node = np.argmin(candidates)
+        
+        in_tree[node] = 1
+        in_queue[node] = 0
+
+        for out in instance.out_nodes[node]:
+            new_dist = node_dist[node] + instance.adj[node][out]
+            
+            # Relax edge
+            # If out is not in tree AND (not in queue OR found a shorter path)
+            if in_tree[out] == 0 and (in_queue[out] == 0 or new_dist < node_dist[out]):
+                pointers[out] = np.zeros(n, dtype=np.int32)
+                pointers[out][node] = 1
+                node_dist[out] = new_dist
+                in_queue[out] = 1
+
+        push_states(
+            node_states, edge_states, scalars,
+            (in_queue, in_tree), (pointers, self_loops),
+            (compute_current_scalars(node_dist),),
+        )
+
+    # Pad trajectory
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (in_queue, in_tree), (pointers, self_loops),
+            (compute_current_scalars(node_dist),),
+        )
+
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
+
+
+
+
 
 def a_star(instance: ProblemInstance):
     """
-    NEW: A* Search
-    Uses instance.pos (coordinates) and instance.goal for heuristics.
-    Hints: pred (pointer), f_score (scalar), in_open, in_closed, is_goal (masks).
+    A* Search with architecture-aligned hints.
+    
+    1. Uses 1e3 as 'Infinity' to prevent loss explosion in ScalarUpdater.
+    2. Reweights edge scalar hints to (w - h_u + h_v) so the relaxation 
+       module's inductive bias (sender + edge < receiver) holds true 
+       for f-scores.
     """
     n = instance.adj.shape[0]
     node_states = []
@@ -399,23 +402,44 @@ def a_star(instance: ProblemInstance):
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    # Heuristic: Euclidean
+    # 1. Calculate Heuristics
     if instance.pos.ndim == 2:
         h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
     else:
         h_vals = np.abs(instance.pos - instance.pos[instance.goal])
 
-    # Initialize f_score to 0 (garbage), will be masked by in_open
-    g_score = np.zeros(n)
-    f_score = np.zeros(n)
+    # 2. Initialization with 1e3 (Stable Infinity)
+    INF = 1e3
+    g_score = np.full(n, INF, dtype=np.float32)
+    f_score = np.full(n, INF, dtype=np.float32)
+
+    # 3. Pre-calculate Reweighted Edge Hints (Potential Function)
+    # The network sees: f(u) + (w_uv - h(u) + h(v)) = f(v)
+    # This satisfies the 'sender + edge < receiver' check in processors.py
+    h_src = h_vals[instance.edge_index[0]]
+    h_dst = h_vals[instance.edge_index[1]]
+    w_uv = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+    
+    # Note: For valid heuristics, w - h(u) + h(v) >= 0 (Consistency/Monotonicity)
+    reweighted_edges = w_uv - h_src + h_dst
 
     def compute_current_scalars(f_vals):
-        # Scalar Hint: f_score on self loops, weights on edges
-        s = instance.adj[instance.edge_index[0], instance.edge_index[1]] # Weights
+        # Scalar Hint Construction:
+        # - Edges: Reweighted costs
+        # - Self-loops: Current f_scores
+        s = np.copy(reweighted_edges)
+        
+        # Identify self-loops in the edge_index
         mask_loops = instance.edge_index[0] == instance.edge_index[1]
-        s[mask_loops] = f_vals
+        
+        # Get the node indices corresponding to these self-loops
+        loop_node_indices = instance.edge_index[0][mask_loops]
+        
+        # Assign current f_scores to self-loops
+        s[mask_loops] = f_vals[loop_node_indices]
         return s
 
+    # Setup Start Node
     g_score[instance.start] = 0
     f_score[instance.start] = h_vals[instance.start]
     in_open[instance.start] = 1
@@ -428,10 +452,13 @@ def a_star(instance: ProblemInstance):
     )
 
     for _ in range(n):
-        # Priority: f_score. Unvisited nodes (in_open=0) get +1e9 penalty
-        candidates = f_score + (1.0 - in_open) * 1e9
+        # Priority: f_score. 
+        # Add INF penalty to nodes NOT in open set.
+        candidates = f_score + (1.0 - in_open) * INF
         
-        if np.min(candidates) >= 1e9: break 
+        # If min is >= INF, queue is empty or exhausted
+        if np.min(candidates) >= INF: 
+            break 
         
         current = np.argmin(candidates)
         
@@ -451,9 +478,9 @@ def a_star(instance: ProblemInstance):
         for neighbor in instance.out_nodes[current]:
             if in_closed[neighbor]: continue
 
+            # Standard A* Logic (uses original weights 'g + w')
             tentative_g = g_score[current] + instance.adj[current][neighbor]
             
-            # If neighbor not in open, or we found a better path
             if in_open[neighbor] == 0 or tentative_g < g_score[neighbor]:
                 pointers[neighbor] = np.zeros(n, dtype=np.int32)
                 pointers[neighbor][current] = 1
@@ -467,6 +494,7 @@ def a_star(instance: ProblemInstance):
             (compute_current_scalars(f_score),),
         )
 
+    # Pad trajectory
     while len(node_states) < n:
         push_states(
             node_states, edge_states, scalars,
@@ -888,13 +916,16 @@ SPEC["a_star"] = ((MASK, MASK, MASK), (NODE_POINTER, NODE_POINTER))
 # Eccentricity: visited, msg_phase (2 node masks) -> tree pointers, self-loops (2 edge pointers)
 SPEC["eccentricity"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
 
+MAX_NODE_STATES = max(len(s[0]) for s in SPEC.values())
+MAX_EDGE_STATES = max(len(s[1]) for s in SPEC.values())
+
 ALGORITHMS = {
     "bfs": bfs, #==breadth first search
     "dfs": dfs, #==depth first search
     "mst": mst, #==PRIM as that is the algorithm used
     "dijkstra": dijkstra, #==SP as that is the algorithm used
     "mis": mis, #==maximum independent set
-    "a_star": a_star, #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges 
+    "a_star": a_star, #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges? no relaxation already possible
     "eccentricity": eccentricity, #==eccentricity of source node (max shorttest distance to reach any other node)
 }
 
@@ -1014,7 +1045,7 @@ def create_lazy_dataloader(config, split, seed, device, num_workers=0):
         torch.manual_seed(worker_seed)
 
     # Use torch.utils.data.DataLoader + collate that builds a PyG Batch
-    loader = torch.utils.data.DataLoader(
+    loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=False,
@@ -1191,6 +1222,10 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
         if datapoints is not None:
             return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True, collate_fn=pad_and_collate)
     
+
+    target_node_states = max(config.num_node_states, MAX_NODE_STATES)
+    target_edge_states = max(config.num_edge_states, MAX_EDGE_STATES)
+
     # Generate data (original logic)
     np.random.seed(seed)
     datapoints = []
@@ -1223,8 +1258,8 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
         scalars = torch.transpose(torch.tensor(scalars), 0, 1)
         
         # Pad features to expected dimensions
-        node_fts = _pad_features(node_fts, config.num_node_states)
-        edge_fts = _pad_features(edge_fts, config.num_edge_states)
+        node_fts = _pad_features(node_fts, target_node_states)
+        edge_fts = _pad_features(edge_fts, target_edge_states)
 
         output_fts = edge_fts if config.output_type == "pointer" else node_fts
         y = output_fts[:, -1, config.output_idx].clone().detach()

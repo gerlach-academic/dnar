@@ -9,3 +9,4 @@ runs
 /venv/
 /wandb/
 /out/
+/tmp/

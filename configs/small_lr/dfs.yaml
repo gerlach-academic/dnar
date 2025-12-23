@@ -1,7 +1,6 @@
-algorithm: dijkstra
+algorithm: dfs
 
-# learning_rate: 0.001
-
+learning_rate: 0.00001
 # --- data ---
 num_samples:
   train: 10000
@@ -13,8 +12,9 @@ problem_size:
   val: 16
   test: 64
 
-edge_weights: true
 
 # --- model ---
-num_node_states: 2
-num_edge_states: 2
+num_node_states: 4
+num_edge_states: 3
+
+project: str = 'dnar_single_large_lr'

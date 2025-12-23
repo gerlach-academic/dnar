@@ -1,6 +1,6 @@
 algorithm: dijkstra
 
-# learning_rate: 0.001
+learning_rate: 0.001
 
 # --- data ---
 num_samples:
@@ -18,3 +18,5 @@ edge_weights: true
 # --- model ---
 num_node_states: 2
 num_edge_states: 2
+
+project: str = 'dnar_single_large_lr'

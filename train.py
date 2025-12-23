@@ -243,10 +243,11 @@ def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, step
 
 def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
     device = torch.device(
-        (f"cuda:{gpu_id}" if gpu_id is not None else get_gpus(1)[0]) 
+        ((f"cuda:{gpu_id}" if gpu_id>=0 else "cuda") if gpu_id is not None else get_gpus(1)[0]) 
             if torch.cuda.is_available() else "cpu"
     )
-    torch.cuda.set_per_process_memory_fraction(0.2, device=device)
+    if gpu_id is not None and gpu_id >=0:
+        torch.cuda.set_per_process_memory_fraction(0.2, device=device)
 
     model = models.Dnar(config).to(device)
 
@@ -283,7 +284,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
         if last_checkpoint and Path(last_checkpoint).exists():
             print(f"Loading checkpoint from {last_checkpoint}")
             # CHANGED: Use simple torch.load for single-task
-            checkpoint = torch.load(last_checkpoint)
+            checkpoint = torch.load(last_checkpoint, map_location='cuda' if torch.cuda.is_available() else 'cpu')
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 resume_from_step = checkpoint.get('step', resume_from_step)
@@ -592,10 +593,11 @@ def train_multitask(configs: List[base_config.Config], seed: int,
     Multitask training with restart support.
     """
     device = torch.device(
-        (f"cuda:{gpu_id}" if gpu_id is not None else get_gpus(1)[0]) 
+        ((f"cuda:{gpu_id}" if gpu_id>=0 else "cuda") if gpu_id is not None else get_gpus(1)[0]) 
         if torch.cuda.is_available() else "cpu"
     )
-    torch.cuda.set_per_process_memory_fraction(0.2, device=device)
+    if gpu_id is not None and gpu_id >=0:
+        torch.cuda.set_per_process_memory_fraction(0.2, device=device)
     
     
     # Validate configs
@@ -697,7 +699,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         
         if last_checkpoint and Path(last_checkpoint).exists():
             print(f"Loading checkpoint from {last_checkpoint}")
-            checkpoint = torch.load(last_checkpoint)
+            checkpoint = torch.load(last_checkpoint, map_location='cuda' if torch.cuda.is_available() else 'cpu')
             model.load_state_dict(checkpoint['model_state_dict'])
             
             # Restore multitask registry state
@@ -804,7 +806,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
             
             # Evaluate periodically
             if steps_per_algorithm[algorithm] % unified_config.eval_each == 1:
-                val_scores, test_scores = evaluate(
+                val_scores, test_scores, val_loss, test_loss = evaluate(
                     model,
                     val_dataloaders[algorithm],
                     test_dataloaders[algorithm],
@@ -819,6 +821,8 @@ def train_multitask(configs: List[base_config.Config], seed: int,
                     round_metrics_buffer[f"Val/{algorithm}/{k}"] = v
                 for k, v in test_scores.items():
                     round_metrics_buffer[f"Test/{algorithm}/{k}"] = v
+                round_metrics_buffer[f"Val/{algorithm}/loss"] = val_loss
+                round_metrics_buffer[f"Test/{algorithm}/loss"] = test_loss
             
             # Progress logging
             if steps % (100 * len(algorithms)) == 0:
@@ -1122,9 +1126,14 @@ def train_worker(args):
         raise ValueError("Invalid number of arguments for train_worker")
     
     # --- Device setup ---
-    torch.cuda.set_device(gpu_id)
-    device = torch.device(f"cuda:{gpu_id}")
-    torch.cuda.set_per_process_memory_fraction(0.2, device=device)
+    if gpu_id >=0:
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f"cuda:{gpu_id}")
+        torch.cuda.set_per_process_memory_fraction(0.2, device=device)
+    else: #if mig shared set gpu_id==-1
+        torch.cuda.set_device(0)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.cuda.set_per_process_memory_fraction(1, device=device)
 
     # --- Reproducibility ---
     np.random.seed(seed)
@@ -1207,6 +1216,10 @@ if __name__ == "__main__":
                         help="Clean up all incomplete training job state files except those matching the given substring")
     parser.add_argument("--clean_job", type=str, default=None,
                         help="Clean up specific job by session ID (e.g., 'bfs_seed40')")
+    parser.add_argument("--archive_job", type=str, default=None,
+                        help="Archive specific completed job by session ID (e.g., 'bfs_seed40')")
+    parser.add_argument("--unarchive_job", type=str, default=None,
+                        help="Unarchive specific completed job by session ID (e.g., 'bfs_seed40')")
     parser.add_argument("--max_runtime_minutes", type=int, default=23,
                         help="Maximum runtime per training session in minutes (default: 23)")
     parser.add_argument("--patience", type=int, default=5,
@@ -1238,6 +1251,15 @@ if __name__ == "__main__":
     if options.clean_job:
         manager = RestartManager()
         manager.clean_job(options.clean_job)
+        exit()
+
+    if options.archive_job:
+        manager = RestartManager()
+        manager.archive_job(options.archive_job)
+        exit()    
+    if options.unarchive_job:
+        manager = RestartManager()
+        manager.unarchive_job(options.unarchive_job)
         exit()
     
     # Handle restart mode
@@ -1289,7 +1311,7 @@ if __name__ == "__main__":
                         multitask=multitask,
                         parallel=False,
                         num_workers=1,
-                        gpus=str(gpu_id),
+                        gpus=int(gpu_id),
                         restart=False,
                         list_jobs=False,
                         clean_jobs=False,
@@ -1355,10 +1377,10 @@ if __name__ == "__main__":
                         raise ValueError("Config must have multitask_algorithms set")
                     configs = configs_from_multitask_config(base_cfg)
                 
-                model = train_multitask(configs, job['seed'], session=session)
+                model = train_multitask(configs, job['seed'], session=session, gpu_id=int(options.gpus) if options.gpus else None)
             else:
                 config = base_config.read_config(job['config_path'])
-                model = train(config, job['seed'], session=session)
+                model = train(config, job['seed'], session=session, gpu_id=int(options.gpus) if options.gpus else None)
             
             exit()
     
@@ -1405,7 +1427,7 @@ if __name__ == "__main__":
             
             #Get algorithms list for session
             algorithms = []
-            if options.multitask:
+            if options.multitask or "multitask" in options.config_path:
                 if "," in options.config_path:
                     config_paths = [p.strip() for p in options.config_path.split(",")]
                     configs = [base_config.read_config(path) for path in config_paths]
@@ -1427,8 +1449,8 @@ if __name__ == "__main__":
             )
 
             if options.multitask:
-                model = train_multitask(configs, seed, session=session)
+                model = train_multitask(configs, seed, session=session, gpu_id=int(options.gpus) if options.gpus else None)
             else:
                 print("Train with config {}".format(options.config_path))
                 config = base_config.read_config(options.config_path)
-                model = train(config, seed, session=session)
+                model = train(config, seed, session=session, gpu_id=int(options.gpus) if options.gpus else None)

@@ -59,7 +59,7 @@ class Config:
     out_directory: str = 'out'
     tensorboard_logs: bool = True
     wandb_logs: bool = True
-    project: str = 'dnar_single'
+    project: str = "str = 'dnar_single_large_lr'"
     wandb_entity: Optional[str] = None  # Your wandb username or team name
 
 
