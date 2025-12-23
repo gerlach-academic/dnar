@@ -25,7 +25,7 @@ class ProblemInstance:
     def __init__(self, adj, start, goal, weighted, randomness, pos=None):
         self.adj = np.copy(adj)
         self.start = start
-        self.goal = goal  # NEW: Goal node for planning
+        self.goal = goal
         self.weighted = weighted
         self.randomness = np.copy(randomness) if randomness is not None else None
         self.edge_index = np.stack(np.nonzero(adj + np.eye(adj.shape[0])))
@@ -40,7 +40,7 @@ class ProblemInstance:
         if pos is not None:
             self.pos = pos
         else:
-            random_pos = np.random.uniform(0.0, 1.0, (adj.shape[0],))
+            random_pos = np.random.uniform(0.0, 1.0, (n,))
             self.pos = random_pos[np.argsort(random_pos)]
 
 def push_states(
@@ -366,13 +366,15 @@ def dijkstra(instance: ProblemInstance):
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
-def a_star(instance: ProblemInstance, build_full_tree: bool = True):
+def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Optional[int]=None):
     n = instance.adj.shape[0]
     node_states = []
     edge_states = []
     scalars = []
 
-    # Masks
+    target_len = pad_len if pad_len is not None else n
+
+    # --- 1. Masks & Pointers ---
     in_open = np.zeros(n, dtype=np.int32)
     in_closed = np.zeros(n, dtype=np.int32)
     is_goal = np.zeros(n, dtype=np.int32)
@@ -381,61 +383,84 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True):
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    # --- Scaling & Heuristics ---
+    # --- 2. Scaling Factor Calculation ---
     edge_weights = instance.adj[instance.edge_index[0], instance.edge_index[1]]
     avg_weight = np.mean(edge_weights)
     scale_factor = 1.0
     if avg_weight > 0.5: 
         scale_factor = 1.0 / math.sqrt(n)
 
+    # --- 3. Heuristics ---
     if instance.pos.ndim == 2:
         h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
     else:
         h_vals = np.abs(instance.pos - instance.pos[instance.goal])
 
-    # Initialization
+    # --- 4. Initialization ---
     g_score = np.zeros(n, dtype=np.float32)
     f_score_raw = np.copy(h_vals)
     
-    # Hint Pre-calculation (Potential Function)
+    # --- 5. HINT PHYSICS SETUP ---
+    # Edge Hint: Potential Function w' = w - h(u) + h(v)
     h_src = h_vals[instance.edge_index[0]]
     h_dst = h_vals[instance.edge_index[1]]
     w_uv = instance.adj[instance.edge_index[0], instance.edge_index[1]]
     
-    # Hints are scaled for the network
     edge_hint_val = (w_uv - h_src + h_dst) * scale_factor
 
-    def compute_current_scalars(f_vals_raw):
+    # --- 6. TIE-BREAKING HELPER (Crucial for Geometric Graphs) ---
+    # Preference: Lower f. If f equal, Higher g (closer to goal).
+    # Rank = f - (epsilon * g)
+    EPS = 1e-4 
+
+    def compute_current_scalars(g_curr, f_curr):
         s = np.copy(edge_hint_val)
         mask_loops = instance.edge_index[0] == instance.edge_index[1]
-        s[mask_loops] = f_vals_raw[instance.edge_index[0][mask_loops]] * scale_factor
+        
+        # This catches the specific graph causing your crash
+        if mask_loops.sum() != n:
+             raise ValueError(f"Graph Error: Found {mask_loops.sum()} self-loops, expected {n}")
+
+        # Calculate Rank for hints
+        # This tells the network: "Even if f is same, this node is numerically smaller/better"
+        ranks = (f_curr - EPS * g_curr) * scale_factor
+        
+        s[mask_loops] = ranks[instance.edge_index[0][mask_loops]]
         return s
 
+    # Setup Start Node
     g_score[instance.start] = 0
     f_score_raw[instance.start] = h_vals[instance.start]
     in_open[instance.start] = 1
 
+    # Initial Push
     push_states(
         node_states, edge_states, scalars,
         (in_open, in_closed, is_goal), (pointers, self_loops),
-        (compute_current_scalars(f_score_raw),),
+        (compute_current_scalars(g_score, f_score_raw),), #returns one score which is 
     )
 
     for _ in range(n):
-        candidates = f_score_raw + (1.0 - in_open) * 1e9 
-        if np.min(candidates) >= 1e9: break 
+        # --- 7. SELECTION LOGIC WITH TIE-BREAKING ---
+        # We perform argmin on the RANK, not just raw F.
+        # This ensures Python selection matches the Network's gradient signal.
+        current_ranks = f_score_raw - (EPS * g_score)
+        
+        candidates = current_ranks + (1.0 - in_open) * 1e9 
+        
+        if np.min(candidates) >= 1e9: 
+            break 
         
         current = np.argmin(candidates)
         
-        # --- TOGGLE LOGIC ---
+        # --- 8. TOGGLE LOGIC ---
         if not build_full_tree and current == instance.goal:
-            # Mark goal as closed and save final state
             in_open[current] = 0
             in_closed[current] = 1
             push_states(
                 node_states, edge_states, scalars,
                 (in_open, in_closed, is_goal), (pointers, self_loops),
-                (compute_current_scalars(f_score_raw),),
+                (compute_current_scalars(g_score, f_score_raw),),
             )
             break
 
@@ -457,18 +482,17 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True):
         push_states(
             node_states, edge_states, scalars,
             (in_open, in_closed, is_goal), (pointers, self_loops),
-            (compute_current_scalars(f_score_raw),),
+            (compute_current_scalars(g_score, f_score_raw),),
         )
 
-    # Only pad if we are building the full tree (or if required by batching)
-    # Usually for training we pad, for inference we might not need to.
-    if build_full_tree:
-        while len(node_states) < n:
-            push_states(
-                node_states, edge_states, scalars,
-                (in_open, in_closed, is_goal), (pointers, self_loops),
-                (compute_current_scalars(f_score_raw),),
-            )
+    # if build_full_tree:
+    #fill the rest of the tree with the last state so the model basically stops updating on goal reached
+    while len(node_states) < target_len:
+        push_states(
+            node_states, edge_states, scalars,
+            (in_open, in_closed, is_goal), (pointers, self_loops),
+            (compute_current_scalars(g_score, f_score_raw),),
+        )
         
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
@@ -1163,7 +1187,10 @@ def load_dataset_from_cache(cache_path: Path, device, expected_seed: int) -> Opt
 def pad_and_collate(batch):
     """
     Pads time and node dimensions so PyG can batch variable-sized graph trajectories.
-    Assumes node_fts is (Nodes, Time, Features).
+    Robustly handles:
+    1. Variable Time Steps (T)
+    2. Variable Node Counts (N) -> Adds Ghost Nodes
+    3. Hybrid Targets (y) -> Detects if y is Node-level (Index) or Edge-level (Mask) and pads accordingly.
     """
     if not batch:
         return Batch.from_data_list([])
@@ -1176,34 +1203,67 @@ def pad_and_collate(batch):
 
     for d in batch:
         N, T, F = d.node_fts.shape
+        E_orig = d.edge_fts.shape[0]
         _, _, EF = d.edge_fts.shape
         _, _, S_dim = d.scalars.shape
 
-        # ---- pad node_fts: (N, T, F) -> (max_N, max_T, F) ----
+        # 1. Pad node_fts: (N, T, F) -> (max_N, max_T, F)
         node_pad = torch.zeros((max_N, max_T, F), dtype=d.node_fts.dtype)
         node_pad[:N, :T, :] = d.node_fts
 
-        # ---- pad edge_fts: (Edges, T, F) -> (Edges, max_T, F) ----
-        # Note: We do NOT pad the number of edges (dim 0). PyG handles variable edge counts natively.
-        # We only pad the Time dimension.
-        E = d.edge_fts.shape[0]
-        edge_pad = torch.zeros((E, max_T, EF), dtype=d.edge_fts.dtype)
+        # 2. Pad edge_fts: (E, T, F) -> (E, max_T, F) (Time padding only)
+        edge_pad = torch.zeros((E_orig, max_T, EF), dtype=d.edge_fts.dtype)
         edge_pad[:, :T, :] = d.edge_fts
 
-        # ---- pad scalars: (Edges, T, S) -> (Edges, max_T, S) ----
-        scalars_pad = torch.zeros((E, max_T, S_dim), dtype=d.scalars.dtype)
+        # 3. Pad scalars: (E, T, S) -> (E, max_T, S)
+        scalars_pad = torch.zeros((E_orig, max_T, S_dim), dtype=d.scalars.dtype)
         scalars_pad[:, :T, :] = d.scalars
+        
+        current_edge_index = d.edge_index
+        current_y = d.y
 
-        # We set num_nodes=max_N. 
-        # Batch.from_data_list will automatically shift edge_index by accumulating num_nodes.
-        # The padded "dummy" nodes (indices N to max_N-1) will be isolated.
+        # --- FIX: GHOST NODES INJECTION ---
+        if N < max_N:
+            num_ghosts = max_N - N
+            
+            # A. Create Ghost Topology (Self-Loops)
+            ghost_indices = torch.arange(N, max_N, dtype=torch.long)
+            ghost_loops = torch.stack([ghost_indices, ghost_indices], dim=0)
+            
+            current_edge_index = torch.cat([d.edge_index, ghost_loops], dim=1)
+            
+            # B. Create Ghost Features (Zeros)
+            ghost_edge_attrs = torch.zeros((num_ghosts, max_T, EF), dtype=d.edge_fts.dtype)
+            ghost_scalars = torch.zeros((num_ghosts, max_T, S_dim), dtype=d.scalars.dtype)
+            
+            edge_pad = torch.cat([edge_pad, ghost_edge_attrs], dim=0)
+            scalars_pad = torch.cat([scalars_pad, ghost_scalars], dim=0)
+
+            # C. Pad Ground Truth 'y'
+            # Check if y is Node-Level (size N) or Edge-Level (size E)
+            if d.y is not None:
+                if d.y.shape[0] == N: 
+                    # Node-Level: Pad with Self-Indices
+                    y_pad = torch.zeros((max_N,), dtype=d.y.dtype)
+                    y_pad[:N] = d.y
+                    y_pad[N:] = ghost_indices # Ghosts point to self
+                    current_y = y_pad
+                elif d.y.shape[0] == E_orig:
+                    # Edge-Level: Append labels for the new ghost loops
+                    # Ghosts point to self, so the self-loop edge is TRUE (1)
+                    ghost_labels = torch.ones((num_ghosts,), dtype=d.y.dtype)
+                    current_y = torch.cat([d.y, ghost_labels], dim=0)
+                else:
+                    # Fallback (e.g. Graph-level label): No padding needed usually
+                    pass
+
         padded_list.append(
             Data(
                 node_fts=node_pad,
                 edge_fts=edge_pad,
                 scalars=scalars_pad,
-                edge_index=d.edge_index,
-                y=d.y,
+                edge_index=current_edge_index,
+                y=current_y, 
                 pos=d.pos,
                 goal=d.goal,
                 num_nodes=max_N, 
@@ -1258,9 +1318,9 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
 
         if config.algorithm == 'a_star':
             # A* needs pos for heuristic
-            node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=split=='train')
+            node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=False, pad_len = config.problem_size[split])
         else:
-            node_fts, edge_fts, scalars =algorithm(instance)
+            node_fts, edge_fts, scalars = algorithm(instance)
 
         edge_index = torch.tensor(instance.edge_index).contiguous()
 
