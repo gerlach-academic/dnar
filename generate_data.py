@@ -315,160 +315,127 @@ def dijkstra(instance: ProblemInstance):
 
     in_queue = np.zeros(n, dtype=np.int32)
     in_tree = np.zeros(n, dtype=np.int32)
+
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    node_dist = np.zeros(n, dtype=np.float32) #changed from position to zero, as was not informative anyways
+    node_scalars = instance.pos
 
-    def compute_current_scalars(dist_vals):
-        # Edge features = Weights. Self-loops = Distance Estimates.
-        s = instance.adj[instance.edge_index[0], instance.edge_index[1]]
-        s[instance.edge_index[0] == instance.edge_index[1]] = dist_vals
-        return s
+    def compute_current_scalars(node_scalars):
+        scalars = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+        scalars[instance.edge_index[0] == instance.edge_index[1]] = node_scalars
+        return scalars
 
     in_queue[instance.start] = 1
-    # node_dist[start] is already 0, which is correct for the start node.
-    
+    node_scalars[instance.start] = 0
+
     push_states(
-        node_states, edge_states, scalars,
-        (in_queue, in_tree), (pointers, self_loops),
-        (compute_current_scalars(node_dist),),
+        node_states,
+        edge_states,
+        scalars,
+        (in_queue, in_tree),
+        (pointers, self_loops),
+        (compute_current_scalars(node_scalars),),
     )
 
-    for _ in range(n):
-        # Priority Queue selection:
-        # Add 1e9 to nodes NOT in queue. This makes them "Infinite" to argsort.
-        candidates = node_dist + (1.0 - in_queue) * 1e3
-        
-        # If min is >= 1e9, queue is empty.
-        if np.min(candidates) >= 1e9: 
-            break
-        
-        node = np.argmin(candidates)
-        
+    for _ in range(1, n):
+        node = np.argsort(node_scalars + (1.0 - in_queue) * 1e3)[0]
+        assert in_queue[node] == 1
+
         in_tree[node] = 1
         in_queue[node] = 0
 
         for out in instance.out_nodes[node]:
-            new_dist = node_dist[node] + instance.adj[node][out]
-            
-            # Relax edge
-            # If out is not in tree AND (not in queue OR found a shorter path)
-            if in_tree[out] == 0 and (in_queue[out] == 0 or new_dist < node_dist[out]):
+            if in_tree[out] == 0 and (
+                in_queue[out] == 0
+                or node_scalars[node] + instance.adj[node][out] < node_scalars[out]
+            ):
                 pointers[out] = np.zeros(n, dtype=np.int32)
                 pointers[out][node] = 1
-                node_dist[out] = new_dist
+                node_scalars[out] = node_scalars[node] + instance.adj[node][out]
                 in_queue[out] = 1
 
         push_states(
-            node_states, edge_states, scalars,
-            (in_queue, in_tree), (pointers, self_loops),
-            (compute_current_scalars(node_dist),),
-        )
-
-    # Pad trajectory
-    while len(node_states) < n:
-        push_states(
-            node_states, edge_states, scalars,
-            (in_queue, in_tree), (pointers, self_loops),
-            (compute_current_scalars(node_dist),),
+            node_states,
+            edge_states,
+            scalars,
+            (in_queue, in_tree),
+            (pointers, self_loops),
+            (compute_current_scalars(node_scalars),),
         )
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
-
-
-
-
-def a_star(instance: ProblemInstance):
-    """
-    A* Search with architecture-aligned hints.
-    
-    1. Uses 1e3 as 'Infinity' to prevent loss explosion in ScalarUpdater.
-    2. Reweights edge scalar hints to (w - h_u + h_v) so the relaxation 
-       module's inductive bias (sender + edge < receiver) holds true 
-       for f-scores.
-    """
+def a_star(instance: ProblemInstance, build_full_tree: bool = True):
     n = instance.adj.shape[0]
     node_states = []
     edge_states = []
     scalars = []
 
+    # Masks
     in_open = np.zeros(n, dtype=np.int32)
     in_closed = np.zeros(n, dtype=np.int32)
     is_goal = np.zeros(n, dtype=np.int32)
     is_goal[instance.goal] = 1
-
+    
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    # 1. Calculate Heuristics
+    # --- Scaling & Heuristics ---
+    edge_weights = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+    avg_weight = np.mean(edge_weights)
+    scale_factor = 1.0
+    if avg_weight > 0.5: 
+        scale_factor = 1.0 / math.sqrt(n)
+
     if instance.pos.ndim == 2:
         h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
     else:
         h_vals = np.abs(instance.pos - instance.pos[instance.goal])
 
-    # 2. Initialization with 1e3 (Stable Infinity)
-    INF = 1e3
-    g_score = np.full(n, INF, dtype=np.float32)
-    f_score = np.full(n, INF, dtype=np.float32)
-
-    # 3. Pre-calculate Reweighted Edge Hints (Potential Function)
-    # The network sees: f(u) + (w_uv - h(u) + h(v)) = f(v)
-    # This satisfies the 'sender + edge < receiver' check in processors.py
+    # Initialization
+    g_score = np.zeros(n, dtype=np.float32)
+    f_score_raw = np.copy(h_vals)
+    
+    # Hint Pre-calculation (Potential Function)
     h_src = h_vals[instance.edge_index[0]]
     h_dst = h_vals[instance.edge_index[1]]
     w_uv = instance.adj[instance.edge_index[0], instance.edge_index[1]]
     
-    # Note: For valid heuristics, w - h(u) + h(v) >= 0 (Consistency/Monotonicity)
-    reweighted_edges = w_uv - h_src + h_dst
+    # Hints are scaled for the network
+    edge_hint_val = (w_uv - h_src + h_dst) * scale_factor
 
-    def compute_current_scalars(f_vals):
-        # Scalar Hint Construction:
-        # - Edges: Reweighted costs
-        # - Self-loops: Current f_scores
-        s = np.copy(reweighted_edges)
-        
-        # Identify self-loops in the edge_index
+    def compute_current_scalars(f_vals_raw):
+        s = np.copy(edge_hint_val)
         mask_loops = instance.edge_index[0] == instance.edge_index[1]
-        
-        # Get the node indices corresponding to these self-loops
-        loop_node_indices = instance.edge_index[0][mask_loops]
-        
-        # Assign current f_scores to self-loops
-        s[mask_loops] = f_vals[loop_node_indices]
+        s[mask_loops] = f_vals_raw[instance.edge_index[0][mask_loops]] * scale_factor
         return s
 
-    # Setup Start Node
     g_score[instance.start] = 0
-    f_score[instance.start] = h_vals[instance.start]
+    f_score_raw[instance.start] = h_vals[instance.start]
     in_open[instance.start] = 1
 
     push_states(
         node_states, edge_states, scalars,
-        (in_open, in_closed, is_goal), 
-        (pointers, self_loops),
-        (compute_current_scalars(f_score),),
+        (in_open, in_closed, is_goal), (pointers, self_loops),
+        (compute_current_scalars(f_score_raw),),
     )
 
     for _ in range(n):
-        # Priority: f_score. 
-        # Add INF penalty to nodes NOT in open set.
-        candidates = f_score + (1.0 - in_open) * INF
-        
-        # If min is >= INF, queue is empty or exhausted
-        if np.min(candidates) >= INF: 
-            break 
+        candidates = f_score_raw + (1.0 - in_open) * 1e9 
+        if np.min(candidates) >= 1e9: break 
         
         current = np.argmin(candidates)
         
-        if current == instance.goal:
+        # --- TOGGLE LOGIC ---
+        if not build_full_tree and current == instance.goal:
+            # Mark goal as closed and save final state
             in_open[current] = 0
             in_closed[current] = 1
             push_states(
                 node_states, edge_states, scalars,
                 (in_open, in_closed, is_goal), (pointers, self_loops),
-                (compute_current_scalars(f_score),),
+                (compute_current_scalars(f_score_raw),),
             )
             break
 
@@ -478,32 +445,32 @@ def a_star(instance: ProblemInstance):
         for neighbor in instance.out_nodes[current]:
             if in_closed[neighbor]: continue
 
-            # Standard A* Logic (uses original weights 'g + w')
             tentative_g = g_score[current] + instance.adj[current][neighbor]
             
             if in_open[neighbor] == 0 or tentative_g < g_score[neighbor]:
                 pointers[neighbor] = np.zeros(n, dtype=np.int32)
                 pointers[neighbor][current] = 1
                 g_score[neighbor] = tentative_g
-                f_score[neighbor] = g_score[neighbor] + h_vals[neighbor]
+                f_score_raw[neighbor] = g_score[neighbor] + h_vals[neighbor]
                 in_open[neighbor] = 1
         
         push_states(
             node_states, edge_states, scalars,
             (in_open, in_closed, is_goal), (pointers, self_loops),
-            (compute_current_scalars(f_score),),
+            (compute_current_scalars(f_score_raw),),
         )
 
-    # Pad trajectory
-    while len(node_states) < n:
-        push_states(
-            node_states, edge_states, scalars,
-            (in_open, in_closed, is_goal), (pointers, self_loops),
-            (compute_current_scalars(f_score),),
-        )
+    # Only pad if we are building the full tree (or if required by batching)
+    # Usually for training we pad, for inference we might not need to.
+    if build_full_tree:
+        while len(node_states) < n:
+            push_states(
+                node_states, edge_states, scalars,
+                (in_open, in_closed, is_goal), (pointers, self_loops),
+                (compute_current_scalars(f_score_raw),),
+            )
         
     return np.array(node_states), np.array(edge_states), np.array(scalars)
-
 
 def eccentricity(instance: ProblemInstance):
     """
@@ -683,6 +650,23 @@ def eccentricity(instance: ProblemInstance):
 # 3. SAMPLERS
 # -----------------------------------------------------------------------------
 
+def embed_positions_from_weights(adj):
+    # Shortest-path Distanzen berechnen (Floyd-Warshall approximation)
+    G = nx.from_numpy_array(adj)
+    dist_dict = dict(nx.all_pairs_dijkstra_path_length(G))
+    
+    n = len(adj)
+    dist_full = np.full((n, n), np.inf)
+    for i in dist_dict:
+        for j in dist_dict[i]:
+            dist_full[i, j] = dist_dict[i][j]
+    
+    # MDS: Finde 2D-Positionen die diese Distanzen approximieren
+    mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+    pos = mds.fit_transform(dist_full)
+    
+    return pos
+
 def er_probabilities(n):
     base = math.log(n) / n
     return (base, base * 3)
@@ -692,6 +676,8 @@ class ErdosRenyiGraphSampler:
         self.weighted = config.edge_weights
         self.generate_random_numbers = config.generate_random_numbers
 
+        self.for_astar = (config.algorithm == 'a_star')
+
     def __call__(self, num_nodes):
         p_segment = er_probabilities(num_nodes)
         p = p_segment[0] + np.random.rand() * (p_segment[1] - p_segment[0])
@@ -699,22 +685,40 @@ class ErdosRenyiGraphSampler:
         start = np.random.randint(0, num_nodes)
         
         while True:
+            # 1. Generate Topology
             adj = np.triu(np.random.binomial(1, p, size=(num_nodes, num_nodes)), k=1)
             adj += adj.T
 
-            if self.weighted: #weights only in [0,1] but because of hard coded relaxation any difference is ok, even 1e-6 between to possible edges, as can still be checked correctly
-                w = np.triu(np.random.uniform(0.0, 1.0, (num_nodes, num_nodes)), k=1)
-                w *= adj
-                adj = w + w.T
+            # 2. Generate Positions (Needed for A* Heuristic consistency)
+            # For ER, we simulate a 1D line embedding to keep it simple but consistent
+            random_pos = np.random.uniform(0.0, 1.0, (num_nodes,))
+            pos = random_pos[np.argsort(random_pos)] # Sort to make 1D structure coherent
+
+            if self.weighted:
+                if self.for_astar:
+                    # FIX FOR A*: Force geometric weights based on 1D position.
+                    # w(u,v) = |pos(u) - pos(v)|
+                    # This guarantees triangle inequality and non-negative hints.
+                    dist_matrix = np.abs(pos[:, None] - pos[None, :])
+                    w = np.triu(dist_matrix * (adj > 0), k=1)
+                    adj = w + w.T
+                    pos = embed_positions_from_weights(adj) # Re-embed in 2D for A*
+                else:
+                    # Standard Random Weights (Fine for Dijkstra/MST/BFS)
+                    w = np.triu(np.random.uniform(0.0, 1.0, (num_nodes, num_nodes)), k=1)
+                    w *= adj
+                    adj = w + w.T
             
             random_numbers = None
             if self.generate_random_numbers:
                 random_numbers = np.random.rand(num_nodes, num_nodes)
 
             goal = (start + 1) % num_nodes # Dummy
-            instance = ProblemInstance(adj, start, goal, self.weighted, random_numbers)
             
-            # Use new BFS which handles 2D pos cleanly
+            # Pass the 1D positions so A* calculates correct h(n)
+            instance = ProblemInstance(adj, start, goal, self.weighted, random_numbers, pos=pos)
+            
+            # Connectivity check (BFS)
             trace, _, _ = bfs(instance)
             if np.all(trace[-1, :, 0] == 1):
                 return instance
@@ -832,8 +836,10 @@ class GridGraphSampler:
         pos_arr = np.array([pos_dict[i] for i in range(N)], dtype=np.float32)
         pos_arr = pos_arr / np.max(pos_arr) # Normalize to [0,1]
 
+        #scale this so that training is stable
+        scale = 1.0 / side
         adj = nx.to_numpy_array(G, weight=None) 
-        adj[adj > 0] = 1.0 
+        adj[adj > 0] = scale 
 
         start = np.random.randint(0, N)
         goal = np.random.randint(0, N)
@@ -1029,6 +1035,8 @@ def create_lazy_dataloader(config, split, seed, device, num_workers=0):
     if graph_type == 'grid':
         sampler = GridGraphSampler(config)
     elif graph_type == 'roadmap':
+        sampler = RoadmapGraphSampler(config)
+    elif graph_type == 'geometric':
         # Use the Geometric sampler for A*
         sampler = GeometricGraphSampler(config) 
     else:
@@ -1246,7 +1254,13 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
     ):
         instance = sampler(config.problem_size[split])
         
-        node_fts, edge_fts, scalars = ALGORITHMS[config.algorithm](instance)
+        algorithm = ALGORITHMS[config.algorithm]
+
+        if config.algorithm == 'a_star':
+            # A* needs pos for heuristic
+            node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=split=='train')
+        else:
+            node_fts, edge_fts, scalars =algorithm(instance)
 
         edge_index = torch.tensor(instance.edge_index).contiguous()
 
