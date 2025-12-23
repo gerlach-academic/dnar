@@ -1,5 +1,6 @@
-algorithm: a_star
+algorithm: dijkstra
 
+# learning_rate: 0.001
 graph_type: geometric
 
 # --- data ---
@@ -16,7 +17,5 @@ problem_size:
 edge_weights: true
 
 # --- model ---
-# A* has 3 node states: in_open, in_closed, is_goal
-num_node_states: 3
-# A* has 2 edge states: pointers, self_loops
+num_node_states: 2
 num_edge_states: 2

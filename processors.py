@@ -2,7 +2,7 @@ import math
 
 import torch
 from torch.nn import Linear, ModuleList, ReLU, Sequential
-from torch.nn.functional import binary_cross_entropy_with_logits
+from torch.nn.functional import binary_cross_entropy_with_logits, softmax
 from torch_geometric.utils import group_argsort, scatter, softmax, to_dense_batch
 from torch.nn.parameter import Parameter
 
@@ -442,13 +442,13 @@ def entmax15(logits, dim=-1):
 
 class AlphaEntmaxHardAttention(torch.nn.Module):
     """
-    Hard Average Attention with Learnable Sparsity (Alpha-Entmax).
+    Signal-Dependent Average Hard Attention via Sparsity Gating.
+    Uses an interpolation of softmax and entmax/sparsemax to create
+    a dynamic sparsity level per node.
     
-    Mechanisms:
-    1. Learnable Alpha: Interpolates between Softmax (1.0) -> Entmax (1.5) -> Sparsemax (2.0).
-    2. Dense Batching: Vectorized operations for speed.
-    3. Self-Loop Fallback: Always includes the node itself to guarantee non-empty selection.
-    4. Hard Average + STE: Forward pass averages selected neighbors; Backward pass learns sparsity.
+    Dynamically predicts the sparsity level (Alpha) for each node based on its state.
+    - Input: Node Features (containing algorithmic hints like 'in_queue').
+    - Output: Alpha value per node, interpolating Softmax <-> Entmax <-> Sparsemax.
     """
     def __init__(self, config):
         super().__init__()
@@ -458,6 +458,7 @@ class AlphaEntmaxHardAttention(torch.nn.Module):
         self.edge_states_encoder = StatesEncoder(config.h, config.num_edge_states)
         self.static_fts_encoder = StatesEncoder(h, 2)
         
+        # Projections
         self.lin_query = Linear(h, h, bias=False)
         self.lin_key = Linear(h, h, bias=False)
         self.lin_value = Linear(h, h, bias=False)
@@ -466,127 +467,115 @@ class AlphaEntmaxHardAttention(torch.nn.Module):
         self.edge_value = Linear(h, h, bias=False)
         self.combine_fts = Linear(3 * h, h, bias=False)
         
+        # Processor Helpers
         self.select_best_virtual = SelectBest(config)
         self.select_best_by_reciever = SelectBest(config)
         
-        # --- Learnable Sparsity Control ---
-        # Parameter 'u' -> Sigmoid(u) determines alpha
-        # Init 0.0 => Sigmoid(0.0) = 0.5 => Exactly Entmax 1.5 start
-        self.alpha_param = Parameter(torch.tensor(0.0))
+        # --- Signal-Dependent Sparsity Gate ---
+        # Predicts 'u' from node features. 
+        # u -> 0 (Softmax/Global Avg), u -> 1 (Sparsemax/Top-1)
+        self.sparsity_gate = Sequential(
+            Linear(h, h),
+            ReLU(),
+            Linear(h, 1)
+        )
 
     def forward(self, node_states, edge_states, scalars, batch, training_step):
-        # 1. Prepare Node & Edge Features
+        # 1. Get Node Context (Includes 'SelectBest' info like masks)
         node_fts = self.select_best_from_virtual(node_states, scalars, batch)
         edge_fts_emb = self.edge_states_encoder(edge_states)
         
-        # 2. Projections
+        # 2. Predict Per-Node Sparsity 'u'
+        # [N, 1]
+        sparsity_u = torch.sigmoid(self.sparsity_gate(node_fts))
+        
+        # 3. Standard Projections
         Q = self.lin_query(node_fts)
         K_nodes = self.lin_key(node_fts)
         V_nodes = self.lin_value(node_fts)
         
-        # 3. Get Edge-Augmented Keys/Values (using your existing logic)
-        # This returns edge_K, edge_V aligned with batch.edge_index
         edge_K, edge_V = self.combined_edge_KV(node_states, edge_fts_emb, scalars, batch)
         
         src_idx, dst_idx = batch.edge_index
-        
-        # Combine Source Node K/V with Edge K/V
-        # Note: K_nodes[src_idx] gets the sender's info
         K_combined_edges = K_nodes[src_idx] + edge_K
         V_combined_edges = V_nodes[src_idx] + edge_V
         
         # 4. Dense Batching
-        # Convert sparse list to [Num_Nodes, Max_Degree, H]
-        # Groups edges by Receiver (dst_idx)
         dense_K, mask = to_dense_batch(K_combined_edges, dst_idx, batch_size=node_states.size(0))
         dense_V, _    = to_dense_batch(V_combined_edges, dst_idx, batch_size=node_states.size(0))
         
-        # 5. Append Self-Loops (Guarantees non-empty attention)
-        # We allow the node to attend to itself if all neighbors are irrelevant
-        self_K = K_nodes.unsqueeze(1) # [N, 1, H]
-        self_V = V_nodes.unsqueeze(1) # [N, 1, H]
+        # 5. Append Self-Loops
+        self_K = K_nodes.unsqueeze(1)
+        self_V = V_nodes.unsqueeze(1)
         
-        # Concat: [N, Max_Deg + 1, H]
         combined_K = torch.cat([self_K, dense_K], dim=1)
         combined_V = torch.cat([self_V, dense_V], dim=1)
         
-        # Update mask to include self-loop (always True at index 0)
         self_mask = torch.ones(node_states.size(0), 1, device=mask.device).bool()
         combined_mask = torch.cat([self_mask, mask], dim=1)
         
         # 6. Compute Logits
-        # Q: [N, H] -> [N, 1, H]
         Q_expanded = Q.unsqueeze(1)
         logits = (Q_expanded * combined_K).sum(dim=-1).squeeze(1) / math.sqrt(self.h)
-        
-        # Mask padding (set to -inf so they get 0 probability)
         logits = logits.masked_fill(~combined_mask, -1e9)
         
-        # 7. Compute Interpolated Probabilities
-        probs = self.compute_interpolated_probs(logits)
+        # 7. Compute Probabilities with Vectorized Sparsity 'u'
+        probs = self.compute_interpolated_probs(logits, sparsity_u)
         
-        # 8. Hard Average with Straight-Through Estimator (STE)
-        # Selection: p > 0 (strictly positive support)
-        # Epsilon 1e-6 for numerical safety against float precision
+        # 8. Hard Average + STE
+        # Note: We rely on the interpolated 'probs' to drive the learning of 'sparsity_gate'
+        # via the backward pass through this STE.
         is_selected = (probs > 1e-6).float()
-        
-        # Denominator: Count selected items
         num_selected = is_selected.sum(dim=1, keepdim=True)
-        
-        # Hard Weights: 1/k for selected items, 0 otherwise
         hard_weights = is_selected / (num_selected + 1e-9)
         
-        # STE:
-        # Forward pass sees 'hard_weights' (Average Hard Attention)
-        # Backward pass sees 'probs' (Continuous Gradients for learning sparsity)
         attention_weights = (hard_weights - probs).detach() + probs
-        
-        # Apply mask one last time
         attention_weights = attention_weights * combined_mask.float()
         
         # 9. Aggregate
         aggregated_message = (attention_weights.unsqueeze(-1) * combined_V).sum(dim=1)
         
-        # 10. Updates
+        # 10. Update
         node_fts = node_fts + aggregated_message
-        
-        # Broadcast update back to edges (Edges point to dst_idx)
         edge_fts_out = edge_fts_emb + aggregated_message[dst_idx]
         
         return node_fts, edge_fts_out
 
-    def compute_interpolated_probs(self, logits):
+    def compute_interpolated_probs(self, logits, u):
         """
-        Piecewise linear interpolation between Softmax, Entmax1.5, and Sparsemax.
+        Vectorized Piecewise Linear Interpolation.
+        Args:
+            logits: [N, Neighbors]
+            u: [N, 1] - The sparsity gate value per node
         """
-        # Learnable gate u in [0, 1]
-        u = torch.sigmoid(self.alpha_param)
+        # We must calculate components for both branches because 'u' varies per node.
+        # Ideally we'd lazy-eval, but torch.where computes both. 
+        # Given CLRS graph sizes, this overhead is negligible compared to Sort/TopK.
         
-        # Branch 1: Softmax <-> Entmax1.5 (Alpha 1.0 to 1.5)
-        if u <= 0.5:
-            # Rescale u from [0, 0.5] to w [0, 1]
-            w = u * 2.0 
-            p_soft = F.softmax(logits, dim=-1)
-            p_15 = entmax15(logits, dim=-1)
-            return (1.0 - w) * p_soft + w * p_15
-            
-        # Branch 2: Entmax1.5 <-> Sparsemax (Alpha 1.5 to 2.0)
-        else:
-            # Rescale u from [0.5, 1.0] to w [0, 1]
-            w = (u - 0.5) * 2.0
-            p_15 = entmax15(logits, dim=-1)
-            p_sparse = sparsemax(logits, dim=-1)
-            return (1.0 - w) * p_15 + w * p_sparse
+        p_15 = entmax15(logits, dim=-1)
+        
+        # Branch A: Softmax <-> Entmax (u <= 0.5)
+        # Rescale u [0, 0.5] -> w [0, 1]
+        w_low = u * 2.0
+        p_soft = softmax(logits, dim=-1)
+        probs_low = (1.0 - w_low) * p_soft + w_low * p_15
+        
+        # Branch B: Entmax <-> Sparsemax (u > 0.5)
+        # Rescale u [0.5, 1.0] -> w [0, 1]
+        w_high = (u - 0.5) * 2.0
+        p_sparse = sparsemax(logits, dim=-1)
+        probs_high = (1.0 - w_high) * p_15 + w_high * p_sparse
+        
+        # Select per node
+        return torch.where(u <= 0.5, probs_low, probs_high)
 
-    # --- Helper methods reused from original code ---
+    # --- Standard Helpers (Assume defined as in previous context) ---
     def compute_static_fts(self, scalars, batch):
         node_scalars = scalars[batch.edge_index[0] == batch.edge_index[1]]
         sender_s = node_scalars[batch.edge_index[0]]
         reciever_s = node_scalars[batch.edge_index[1]]
-        
         rlx = scalars < reciever_s
         rlx_d = sender_s + scalars < reciever_s
-        
         fts = torch.cat([rlx, rlx_d], dim=-1).long()
         return self.static_fts_encoder(fts)
 
@@ -598,17 +587,14 @@ class AlphaEntmaxHardAttention(torch.nn.Module):
         select_best = self.select_best_by_reciever(
             node_states[batch.edge_index[0]], scalars, batch.edge_index[1]
         )
-        
         static_fts = self.compute_static_fts(scalars, batch)
         combined = self.combine_fts(
             torch.cat(
                 [edge_fts, edge_fts[batch.batched_reverse_idx], static_fts], dim=1
             )
         )
-        
         edge_K = self.edge_key(select_best)
         edge_V = self.edge_value(combined)
-        
         return edge_K, edge_V
 
 class ScalarUpdater(torch.nn.Module):
