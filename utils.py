@@ -937,7 +937,7 @@ class TrainingSession:
         if temp_dir is None:
             import os
             user = os.environ.get('USER', 'default')
-            temp_dir = f"/tmp/{user}/experiments"
+            temp_dir = f"tmp" #rn here
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
@@ -1002,7 +1002,7 @@ class TrainingSession:
             self.state["patience_counter"] = 0
             print(f"  > New best val score: {current_val_score:.4f}")
         else:
-            self.state["patience_counter"] = self.state.get("patience_counter", 0) + 1 if best_score==1.0 else 0 #reset if not perfect, as we want to continue training if not perfect until we run out of time
+            self.state["patience_counter"] = self.state.get("patience_counter", 0) + 1 if current_val_score==1.0 else 0 #reset if not perfect, as we want to continue training if not perfect until we run out of time
             print(f"  > No improvement. Patience: {self.state['patience_counter']}/{self.patience} (Best: {best_score:.4f})")
         
         # Save state immediately to persist counter across restarts
@@ -1129,7 +1129,8 @@ class TrainingSession:
             # 1. Setup paths
             if temp_dir is None:
                 user = os.environ.get('USER', 'default')
-                temp_dir = Path(f"/tmp/{user}/experiments")
+                # temp_dir = Path(f"/tmp/{user}/experiments")
+                temp_dir = Path(f"tmp")
             else:
                 temp_dir = Path(temp_dir)
             
@@ -1249,14 +1250,16 @@ class RestartManager:
     def __init__(self, temp_dir: Optional[str] = None):
         if temp_dir is None:
             user = os.environ.get('USER', 'default')
-            temp_dir = f"/tmp/{user}/experiments"
+            temp_dir = f"tmp/"
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
     
     def find_incomplete_jobs(self) -> list[Dict[str, Any]]:
         """Find all incomplete training jobs."""
         incomplete = []
-        
+        # print(list(self.temp_dir.glob("training_state_*.json"))) #debug
+        # print(self.temp_dir) #debug
+        # print(os.listdir(self.temp_dir)) #debug
         for state_file in self.temp_dir.glob("training_state_*.json"):
             with open(state_file, 'r') as f:
                 state = json.load(f)
@@ -1271,12 +1274,13 @@ class RestartManager:
         jobs = self.find_incomplete_jobs()
         if not jobs:
             return None
-        
+        # print(jobs) #debug
         if filter:#filer is the config path
             for job in jobs:
                 print(f"'{job['config_path']}'", type(job['config_path']))
             jobs = [job for job in jobs if filter in job['config_path']] 
         
+        # print("after filter:", jobs) #debug
         # Sort by current step (resume furthest progress first)
         jobs.sort(key=lambda x: x.get("current_step", 0), reverse=True)
         
@@ -1297,6 +1301,7 @@ class RestartManager:
             else:
                 print(f"Skipping job '{job['config_path']}' (recently restarted)")
         
+        print("available jobs:", available_jobs) #debug
         return available_jobs[0] if available_jobs else None
 
     def get_next_jobs(self, num_jobs: int, filter:str=None, force:bool=False) -> list[Dict[str, Any]]:
@@ -1387,6 +1392,37 @@ class RestartManager:
         
         return f"{config_name}_seed{seed}"
 
+    def archive_job(self, session_id: str) -> bool:
+        """Archive a specific job by session ID."""
+        state_file = self.temp_dir / f"training_state_{session_id}.json"
+        
+        if not state_file.exists():
+            print(f"State file not found: {state_file}")
+            print("Available state files:")
+            self.list_jobs()
+            return False
+        
+        archived_dir = state_file.parent / "archived"
+        archived_dir.mkdir(parents=True, exist_ok=True)
+        archived_path = archived_dir / state_file.name
+        
+        print(f"Archiving state file to: {archived_path}")
+        shutil.move(str(state_file), str(archived_path))
+        return True
+
+    def unarchive_job(self, session_id: str) -> bool:
+        """Unarchive a specific job by session ID."""
+        archived_path = self.temp_dir / "archived" / f"training_state_{session_id}.json"
+        
+        if not archived_path.exists():
+            print(f"Archived state file not found: {archived_path}")
+            return False
+        
+        restored_path = self.temp_dir / f"training_state_{session_id}.json"
+        
+        print(f"Restoring state file to: {restored_path}")
+        shutil.move(str(archived_path), str(restored_path))
+        return True
 
 def get_temp_model_dir(models_directory: str, model_name: str, temp_dir: Optional[str] = None) -> Path:
     """
@@ -1402,7 +1438,8 @@ def get_temp_model_dir(models_directory: str, model_name: str, temp_dir: Optiona
     """
     if temp_dir is None:
         user = os.environ.get('USER', 'default')
-        temp_dir = f"/tmp/{user}/experiments"
+        # temp_dir = f"/tmp/{user}/experiments"
+        temp_dir = f"tmp"
     
     temp_path = Path(temp_dir) / "models" / model_name
     temp_path.mkdir(parents=True, exist_ok=True)
@@ -1503,7 +1540,7 @@ def get_least_used_gpus() -> list[int]:
     Get list of GPU IDs sorted by usage (least used first).
     Falls back to all GPUs if nvidia-smi is not available.
     """
-    preferences= [3, 8, 40, 6]
+    preferences= [1, 1, 1, 1]
 
     try:
         import subprocess

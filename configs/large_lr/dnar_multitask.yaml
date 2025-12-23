@@ -18,7 +18,7 @@ graph_type: er  # Erdos-Renyi random graphs
 
 # Training hyperparameters
 batch_size: 32
-learning_rate: 0.0001
+learning_rate: 0.001
 weight_decay: 0.0
 num_iterations: 10000  # Steps PER algorithm (total = num_iterations * num_algorithms)
 eval_each: 100  # Evaluate every N steps
@@ -52,5 +52,5 @@ output_idx: 0
 models_directory: models
 tensorboard_logs: true
 wandb_logs: true  # Set to true to enable Weights & Biases logging
-project: dnar_multitask2  # W&B project name
+project: dnar_single_large_lr  # W&B project name
 # wandb_entity: your_username  # Uncomment and set your W&B username/team
