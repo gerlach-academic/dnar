@@ -1206,6 +1206,8 @@ if __name__ == "__main__":
                         help="Number of parallel workers (default: num_seeds)")
     parser.add_argument("--gpus", type=str, default=None,
                         help="Comma-separated GPU IDs (e.g., '0,1,2'). If not set, uses CUDA_VISIBLE_DEVICES or all GPUs")
+    parser.add_argument("--mig", type=int, default=0,
+                        help="Allows using multiple mig instances on a single GPU for parallel training. set it either to 0 to disable, to 1 to choose the first mig instances, 2 for the last mig instances, amount set by num_workers/num_seeds")
     parser.add_argument("--restart", action="store_true",
                         help="Restart incomplete training jobs")
     parser.add_argument("--list_jobs", action="store_true",
@@ -1228,6 +1230,7 @@ if __name__ == "__main__":
                         help="Force action")
     parser.add_argument("--seed", type=int, default=None,
                         help="Specific seed to restart (only for non-parallel restarts)")
+
 
     options = parser.parse_args()
     
@@ -1288,7 +1291,7 @@ if __name__ == "__main__":
                 gpu_ids = [int(x.strip()) for x in options.gpus.split(',')]
             else:
                 try:
-                    gpu_ids = get_least_used_gpus()
+                    gpu_ids = get_least_used_gpus(options.mig)
                 except Exception as e:
                     if 'CUDA_VISIBLE_DEVICES' in os.environ:
                         gpu_ids = [int(x) for x in os.environ['CUDA_VISIBLE_DEVICES'].split(',') if x]
@@ -1392,7 +1395,7 @@ if __name__ == "__main__":
             gpu_ids = [int(x.strip()) for x in options.gpus.split(',')]
         else:
             try:
-                gpu_ids = get_least_used_gpus()
+                gpu_ids = get_least_used_gpus(options.mig)
             except Exception as e:
                 if 'CUDA_VISIBLE_DEVICES' in os.environ:
                     gpu_ids = [int(x) for x in os.environ['CUDA_VISIBLE_DEVICES'].split(',') if x]
