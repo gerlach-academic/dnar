@@ -804,6 +804,12 @@ class GeometricGraphSampler:
 
         # 6. Extract final data
         final_adj = nx.to_numpy_array(G)
+
+        #add tiny bit of noise to break symmetries
+        if final_n > 1:
+            noise = np.random.uniform(1.00001, 1.0001, size=final_adj.shape) #use additive noise, otherwise weights can become zero in the original
+            final_adj = final_adj * noise
+            final_adj = (final_adj + final_adj.T) / 2 # Ensure symmetry
         
         # We need to map the new indices back to the original positions
         # Since we just used convert_node_labels_to_integers on a subgraph,
@@ -865,6 +871,12 @@ class GridGraphSampler:
         adj = nx.to_numpy_array(G, weight=None) 
         adj[adj > 0] = scale 
 
+        #add tiny bit of noise to break symmetries
+        if N > 1:
+            noise = np.random.uniform(1.00001, 1.0001, size=adj.shape)
+            adj = adj * noise
+            adj = (adj + adj.T) / 2 # Ensure symmetry
+
         start = np.random.randint(0, N)
         goal = np.random.randint(0, N)
         while start == goal:
@@ -911,6 +923,13 @@ class RoadmapGraphSampler:
              adj = nx.to_numpy_array(final_G)
              
         N = adj.shape[0]
+
+        # Add tiny noise to break symmetries
+        if N > 1:
+            noise = np.random.uniform(1.00001, 1.0001, size=adj.shape)
+            adj = adj * noise
+            adj = (adj + adj.T) / 2 # Ensure symmetry
+
         start = np.random.randint(0, N)
         goal = np.random.randint(0, N)
         while start == goal: goal = np.random.randint(0, N)
@@ -958,36 +977,210 @@ ALGORITHMS = {
     "a_star": a_star, #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges? no relaxation already possible
     "eccentricity": eccentricity, #==eccentricity of source node (max shorttest distance to reach any other node)
 }
+import sys
+import ray
 
 def _pad_features(tensor: torch.Tensor, target_features: int) -> torch.Tensor:
-    """
-    Pad the feature dimension (last dim) of a tensor with zeros to reach target_features.
-    
-    Args:
-        tensor: Shape (time, nodes/edges, current_features)
-        target_features: Desired number of features
-    
-    Returns:
-        Tensor with shape (time, nodes/edges, target_features)
-    """
+    """Pad the feature dimension (last dim) of a tensor with zeros."""
     current_features = tensor.shape[-1]
     if current_features >= target_features:
         return tensor
-    
-    # Create padding: zeros for additional features
     pad_size = target_features - current_features
     padding = torch.zeros(*tensor.shape[:-1], pad_size, dtype=tensor.dtype)
     return torch.cat([tensor, padding], dim=-1)
 
+# Pure Python function that processes a CHUNK of samples (no decorators yet)
+def _worker_logic_chunk(args):
+    """Process a chunk of samples in a single worker to reduce Ray overhead."""
+    try:
+        base_seed, config_dict, split, target_node_states, target_edge_states, num_samples_in_chunk = args
+        
+        # 1. Reconstruct Config
+        class SimpleConfig:
+            def __init__(self, d): self.__dict__ = d
+        config = SimpleConfig(config_dict)
 
-def create_dataloader(config: base_config.Config, split: str, seed: int, device):
+        # 2. Initialize Sampler (once per chunk)
+        graph_type = getattr(config, 'graph_type', 'er')
+        if graph_type == 'grid':
+            sampler = GridGraphSampler(config)
+        elif graph_type == 'roadmap':
+            sampler = RoadmapGraphSampler(config)
+        elif graph_type == 'geometric':
+            sampler = GeometricGraphSampler(config)
+        else:
+            sampler = ErdosRenyiGraphSampler(config)
+        
+        algorithm = ALGORITHMS[config.algorithm]
+        
+        results = []
+        for i in range(num_samples_in_chunk):
+            try:
+                # Unique seed per sample
+                np.random.seed(base_seed + i)
+
+                # Generate Instance
+                instance = sampler(config.problem_size[split])
+
+                # Run Algorithm
+                if config.algorithm == 'a_star':
+                    node_fts, edge_fts, scalars = algorithm(
+                        instance, 
+                        build_full_tree=False, 
+                        pad_len=config.problem_size[split]
+                    )
+                else:
+                    node_fts, edge_fts, scalars = algorithm(instance)
+
+                # Format Data (Numpy-side)
+                edge_index = instance.edge_index
+                node_fts = np.transpose(node_fts, (1, 0, 2)) 
+                edge_fts_selected = np.transpose(edge_fts[:, edge_index[0], edge_index[1]], (1, 0, 2))
+                scalars = np.transpose(scalars, (1, 0, 2))
+
+                results.append({
+                    'node_fts': node_fts,
+                    'edge_fts': edge_fts_selected,
+                    'scalars': scalars,
+                    'edge_index': edge_index,
+                    'pos': instance.pos,
+                    'goal': instance.goal,
+                    'output_type': config.output_type,
+                    'output_idx': config.output_idx,
+                    't_node': target_node_states,
+                    't_edge': target_edge_states
+                })
+            except Exception as e:
+                results.append({'error': str(e)})
+        
+        return results
+    except Exception as e:
+        return [{'error': str(e)}]
+
+# Define Ray Remote Function for chunked processing
+@ray.remote
+def _ray_worker_chunk(args):
+    return _worker_logic_chunk(args)
+
+def create_dataloader_distributed(config, split: str, seed: int, num_workers: int = None):
     """
-    Create dataloader with optional caching.
+    Generates dataset using RAY with chunked processing for efficiency.
+    Each Ray task processes multiple samples to reduce scheduling overhead.
+    """
+    # 1. Initialize Ray if not already running
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+
+    num_samples = config.num_samples[split]
     
-    Set config.use_dataset_cache = False to disable caching.
-    Set config.cache_directory to customize cache location (default: 'data_cache').
-    """
-    return create_dataloader_with_cache(config, split, seed, device)
+    # Determine number of workers = number of chunks (one chunk per core)
+    if num_workers is None:
+        num_workers = max(1, int(ray.available_resources().get('CPU', 4)))
+    
+    # Number of chunks equals number of cores for optimal parallelism
+    num_chunks = num_workers
+    chunk_size = (num_samples + num_chunks - 1) // num_chunks
+    
+    target_node_states = max(config.num_node_states, MAX_NODE_STATES)
+    target_edge_states = max(config.num_edge_states, MAX_EDGE_STATES)
+    config_dict = vars(config) if hasattr(config, '__dict__') else config.__dict__
+    
+    # 2. Launch Chunked Tasks
+    print(f"Generating {num_samples} samples with Ray ({num_chunks} chunks of ~{chunk_size} samples each)...")
+    
+    futures = []
+    samples_assigned = 0
+    for chunk_idx in range(num_chunks):
+        samples_in_this_chunk = min(chunk_size, num_samples - samples_assigned)
+        if samples_in_this_chunk <= 0:
+            break
+        # Use seed * large_stride + offset to create non-overlapping seed chains per dataset
+        # This ensures seed=40 and seed=41 don't overlap even with many samples
+        chunk_base_seed = seed * 100000 + samples_assigned
+        
+        task_args = (chunk_base_seed, config_dict, split, target_node_states, target_edge_states, samples_in_this_chunk)
+        futures.append(_ray_worker_chunk.remote(task_args))
+        samples_assigned += samples_in_this_chunk
+
+    # 3. Collect Results with Progress Bar
+    datapoints = []
+    unfinished = futures
+    samples_processed = 0
+    
+    with tqdm.tqdm(total=num_samples, desc="Ray Generation") as pbar:
+        while unfinished:
+            # Wait for chunks to complete (batch of results at once)
+            done, unfinished = ray.wait(unfinished, num_returns=1, timeout=None)
+            
+            for future in done:
+                try:
+                    chunk_results = ray.get(future)
+                    for result in chunk_results:
+                        data = _process_worker_result(result)
+                        if data:
+                            datapoints.append(data)
+                        samples_processed += 1
+                        pbar.update(1)
+                except Exception as e:
+                    print(f"Chunk failure: {e}")
+
+    return datapoints
+
+def _process_worker_result(result):
+    """Helper to convert worker output to PyG Data."""
+    if 'error' in result:
+        # print(f"Sample failed: {result['error']}") 
+        return None
+
+    node_t = torch.tensor(result['node_fts'], dtype=torch.float32)
+    edge_t = torch.tensor(result['edge_fts'], dtype=torch.float32)
+    
+    node_t = _pad_features(node_t, result['t_node'])
+    edge_t = _pad_features(edge_t, result['t_edge'])
+    
+    scalars_t = torch.tensor(result['scalars'], dtype=torch.float32)
+    edge_index_t = torch.tensor(result['edge_index'], dtype=torch.long).contiguous()
+    
+    output_fts = edge_t if result['output_type'] == "pointer" else node_t
+    y = output_fts[:, -1, result['output_idx']].clone().detach().long()
+    
+    return Data(
+        node_fts=node_t,
+        edge_fts=edge_t,
+        scalars=scalars_t,
+        edge_index=edge_index_t,
+        y=y,
+        pos=torch.tensor(result['pos'], dtype=torch.float),
+        goal=torch.tensor(result['goal'], dtype=torch.long)
+    )
+
+def create_dataloader(config: base_config.Config, split: str, seed: int, device, num_workers: int = None):
+    # 1. LAZY LOADING
+    if config.use_lazy_dataset:
+        if num_workers is None: num_workers = 0 
+        return create_lazy_dataloader(config, split, seed, device, num_workers=num_workers)
+
+    # 2. CACHED
+    use_cache = getattr(config, 'use_dataset_cache', True)
+    cache_path = get_cache_path(config, split, seed)
+
+    if use_cache:
+        datapoints = load_dataset_from_cache(cache_path, device, expected_seed=seed)
+        if datapoints is not None:
+            return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True, collate_fn=pad_and_collate)
+
+    # 3. GENERATE (Using Ray)
+    start_time = time.time()
+    datapoints = create_dataloader_distributed(config, split, seed, num_workers=num_workers)
+    
+    duration = time.time() - start_time
+    if len(datapoints) > 0:
+        print(f"Generation finished in {duration:.2f}s")
+    
+    if use_cache and len(datapoints) > 0:
+        save_dataset_to_cache(datapoints, cache_path, seed)
+    
+    return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True, collate_fn=pad_and_collate)
 
 
 class LazyDataset(Dataset):

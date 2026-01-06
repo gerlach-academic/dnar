@@ -1,8 +1,7 @@
 algorithm: a_star
 
-learning_rate: 0.001
 graph_type: geometric
-
+learning_rate: 0.001
 
 # --- data ---
 num_samples:
