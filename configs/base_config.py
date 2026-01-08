@@ -16,7 +16,7 @@ class Config:
     learning_rate: float = 0.0001
     weight_decay: float = 0.0
     num_iterations: int = 10000
-    min_iterations: int = 1000 #do at least this before checking early stopping
+    min_iterations: int = 500 #do at least this before checking early stopping
     eval_each: int = 100 #eval and for early stopping
     stepwise_training: bool = True #whether to use teacher forcing
     processor_upper_t: float = 3. #gumbel annealing temperature start
@@ -29,6 +29,7 @@ class Config:
     edge_weights: bool = False
     generate_random_numbers: bool = False
     graph_type: str = "er"
+    mp_mode: str = "processes" # how to generate data: sequential or threads or processes
 
     # --- model ---
     h: int = 128
