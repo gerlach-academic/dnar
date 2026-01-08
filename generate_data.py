@@ -446,54 +446,45 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    # --- 2. Scaling Factor Calculation ---
-    edge_weights = instance.adj[instance.edge_index[0], instance.edge_index[1]]
-    avg_weight = np.mean(edge_weights)
-    scale_factor = 1.0
-    if avg_weight > 0.5: 
-        scale_factor = 1.0 / math.sqrt(n)
-
-    # --- 3. Heuristics ---
+    # --- 2. Heuristics ---
     # For geometric graphs with Euclidean edge weights: Euclidean distance is optimal.
-    # For grid graphs with 4-connectivity (unit cost): Manhattan distance is optimal.
-    # For grid graphs with 8-connectivity: Chebyshev or Octile distance.
-    # Current: Euclidean for 2D, L1 for 1D (matches GeometricGraphSampler edge weights)
+    # Euclidean heuristic is admissible and consistent (triangle inequality).
     if instance.pos.ndim == 2:
         h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
     else:
         h_vals = np.abs(instance.pos - instance.pos[instance.goal])
-    
-    h_start = h_vals[instance.start]  # Constant offset for reduction
 
-    # --- 4. Initialization ---
+    # --- 3. Initialization ---
     # CRITICAL: For true Dijkstra equivalence, undiscovered nodes need random scalars
     # just like Dijkstra uses instance.pos for unvisited nodes.
     # 
     # We track:
-    # - g_score: actual g-values (0 for undiscovered, updated when discovered)
+    # - g_score: actual g-values (updated when discovered)
     # - discovered: mask of which nodes have been reached
     # - init_random: random values for undiscovered nodes (like Dijkstra's instance.pos)
     
     g_score = np.zeros(n, dtype=np.float32)
     discovered = np.zeros(n, dtype=bool)
     
-    # Random initialization for undiscovered nodes - matches Dijkstra's instance.pos pattern
-    # Use the same random values Dijkstra would use
-    init_random = instance.pos[:, 0] if instance.pos.ndim == 2 else instance.pos.copy()
+    # Random initialization for undiscovered nodes - EXACTLY like Dijkstra uses instance.pos
+    # NO SCALING - match Dijkstra exactly
+    init_random = instance.pos[:, 0].astype(np.float32) if instance.pos.ndim == 2 else instance.pos.copy().astype(np.float32)
     
-    # --- 5. HINT PHYSICS SETUP ---
+    # --- 4. HINT PHYSICS SETUP ---
     # Edge Hint: Potential Function w' = w - h(u) + h(v)
-    # This is the key A* → Dijkstra reduction
+    # This is the key A* → Dijkstra reduction. NO SCALING to match Dijkstra.
     h_src = h_vals[instance.edge_index[0]]
     h_dst = h_vals[instance.edge_index[1]]
     w_uv = instance.adj[instance.edge_index[0], instance.edge_index[1]]
     
-    edge_hint_val = (w_uv - h_src + h_dst) * scale_factor
+    # Reduced edge weights - same scale as raw weights in Dijkstra
+    edge_hint_val = w_uv - h_src + h_dst
 
-    # --- 6. NODE SCALAR COMPUTATION ---
-    # For A* → Dijkstra reduction: d'(n) = f(n) - h(start) = g(n) + h(n) - h(start)
-    # BUT: undiscovered nodes get random values (like Dijkstra), not h(n) - h(start)
-    EPS = 1e-4  # Tie-breaking
+    # --- 5. NODE SCALAR COMPUTATION ---
+    # Use f(n) = g(n) + h(n) directly - all values are non-negative!
+    # The relaxation math still works: f(s) + w'(s,r) < f(r) ⟺ g(s) + w < g(r)
+    # Start has f(start) = 0 + h(start) = h(start), not 0, but that's fine.
+    EPS = 1e-4  # Small epsilon for tie-breaking
 
     def compute_current_scalars(g_curr, disc_mask):
         s = np.copy(edge_hint_val)
@@ -502,12 +493,12 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
         if mask_loops.sum() != n:
              raise ValueError(f"Graph Error: Found {mask_loops.sum()} self-loops, expected {n}")
 
-        # For DISCOVERED nodes: d'(n) = g(n) + h(n) - h(start) - EPS*g(n)
-        # For UNDISCOVERED nodes: use random init (like Dijkstra)
-        d_prime_discovered = (g_curr + h_vals - h_start - EPS * g_curr) * scale_factor
+        # For DISCOVERED nodes: f(n) = g + h (always non-negative!)
+        # EPS*g breaks ties in favor of higher g (closer to goal)
+        f_vals = g_curr + h_vals - EPS * g_curr
         
-        # Blend: discovered nodes get proper d', undiscovered get random
-        node_scalars = np.where(disc_mask, d_prime_discovered, init_random)
+        # Blend: discovered nodes get f-values, undiscovered get random
+        node_scalars = np.where(disc_mask, f_vals, init_random)
         
         s[mask_loops] = node_scalars[instance.edge_index[0][mask_loops]]
         return s
@@ -526,9 +517,8 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     )
 
     for _ in range(n):
-        # --- 7. SELECTION LOGIC WITH TIE-BREAKING ---
+        # --- 6. SELECTION LOGIC WITH TIE-BREAKING ---
         # Selection based on f = g + h, with tie-breaking via EPS
-        # We compute: f - EPS*g = g + h - EPS*g = (1-EPS)*g + h
         f_for_selection = g_score + h_vals
         current_ranks = f_for_selection - (EPS * g_score)
         

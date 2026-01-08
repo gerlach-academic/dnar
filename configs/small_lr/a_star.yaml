@@ -2,7 +2,6 @@ algorithm: a_star
 
 graph_type: geometric
 learning_rate: 0.00001
-
 # --- data ---
 num_samples:
   train: 10000
@@ -21,5 +20,3 @@ edge_weights: true
 num_node_states: 3
 # A* has 2 edge states: pointers, self_loops
 num_edge_states: 2
-
-project: str = 'dnar_single_large_lr'
