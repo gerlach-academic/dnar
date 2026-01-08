@@ -112,13 +112,16 @@ class AsyncCheckpointSaver:
                 with open(tmp_path, 'wb') as f:
                     pickle.dump(payload, f)
                 os.replace(tmp_path, path)
+                print(f"  [AsyncSaver] Checkpoint saved to {path}")
             except Exception as e:
                 print(f"  [AsyncSaver] Failed to save checkpoint: {e}")
+        
     
     def flush(self):
         """Block until all pending saves complete."""
         if self.thread is not None and self.thread.is_alive():
             self.thread.join()
+            print("  [AsyncSaver] All pending checkpoints saved.")
 
 # Global singleton
 _checkpoint_saver = AsyncCheckpointSaver()
@@ -330,7 +333,6 @@ if __name__ == "__main__":
         # Each sample at n=1600 is ~500MB, so batching causes OOM
         original_batch_size = config_obj.batch_size
         config_obj.batch_size = 1
-        print(f"  Setting batch_size=1 for large graphs (original={original_batch_size})")
         
         models = {}
         # Skip loading models if we are just going to exit immediately (edge case)
@@ -434,8 +436,8 @@ if __name__ == "__main__":
             if config_obj.algorithm == 'dfs' and args.size >= 600:
                 # DFS has very long traces (~4000 steps for n=800)
                 # But with optimized F.pad collation, we can handle moderate batches
-                dynamic_max_batch = 8  # Balance speed vs memory
-                dynamic_min_batch = 4
+                dynamic_max_batch = 16  # Balance speed vs memory
+                dynamic_min_batch = 8
                 print(f"  Using reduced batch sizes for DFS (max={dynamic_max_batch}, min={dynamic_min_batch}) due to long traces")
             
             with torch.no_grad():

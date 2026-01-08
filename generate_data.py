@@ -454,61 +454,83 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
         scale_factor = 1.0 / math.sqrt(n)
 
     # --- 3. Heuristics ---
+    # For geometric graphs with Euclidean edge weights: Euclidean distance is optimal.
+    # For grid graphs with 4-connectivity (unit cost): Manhattan distance is optimal.
+    # For grid graphs with 8-connectivity: Chebyshev or Octile distance.
+    # Current: Euclidean for 2D, L1 for 1D (matches GeometricGraphSampler edge weights)
     if instance.pos.ndim == 2:
         h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
     else:
         h_vals = np.abs(instance.pos - instance.pos[instance.goal])
+    
+    h_start = h_vals[instance.start]  # Constant offset for reduction
 
     # --- 4. Initialization ---
+    # CRITICAL: For true Dijkstra equivalence, undiscovered nodes need random scalars
+    # just like Dijkstra uses instance.pos for unvisited nodes.
+    # 
+    # We track:
+    # - g_score: actual g-values (0 for undiscovered, updated when discovered)
+    # - discovered: mask of which nodes have been reached
+    # - init_random: random values for undiscovered nodes (like Dijkstra's instance.pos)
+    
     g_score = np.zeros(n, dtype=np.float32)
-    f_score_raw = np.copy(h_vals)
+    discovered = np.zeros(n, dtype=bool)
+    
+    # Random initialization for undiscovered nodes - matches Dijkstra's instance.pos pattern
+    # Use the same random values Dijkstra would use
+    init_random = instance.pos[:, 0] if instance.pos.ndim == 2 else instance.pos.copy()
     
     # --- 5. HINT PHYSICS SETUP ---
     # Edge Hint: Potential Function w' = w - h(u) + h(v)
+    # This is the key A* → Dijkstra reduction
     h_src = h_vals[instance.edge_index[0]]
     h_dst = h_vals[instance.edge_index[1]]
     w_uv = instance.adj[instance.edge_index[0], instance.edge_index[1]]
     
     edge_hint_val = (w_uv - h_src + h_dst) * scale_factor
 
-    # --- 6. TIE-BREAKING HELPER (Crucial for Geometric Graphs) ---
-    # Preference: Lower f. If f equal, Higher g (closer to goal).
-    # Rank = f - (epsilon * g)
-    EPS = 1e-4 
+    # --- 6. NODE SCALAR COMPUTATION ---
+    # For A* → Dijkstra reduction: d'(n) = f(n) - h(start) = g(n) + h(n) - h(start)
+    # BUT: undiscovered nodes get random values (like Dijkstra), not h(n) - h(start)
+    EPS = 1e-4  # Tie-breaking
 
-    def compute_current_scalars(g_curr, f_curr):
+    def compute_current_scalars(g_curr, disc_mask):
         s = np.copy(edge_hint_val)
         mask_loops = instance.edge_index[0] == instance.edge_index[1]
         
-        # This catches the specific graph causing your crash
         if mask_loops.sum() != n:
              raise ValueError(f"Graph Error: Found {mask_loops.sum()} self-loops, expected {n}")
 
-        # Calculate Rank for hints
-        # This tells the network: "Even if f is same, this node is numerically smaller/better"
-        ranks = (f_curr - EPS * g_curr) * scale_factor
+        # For DISCOVERED nodes: d'(n) = g(n) + h(n) - h(start) - EPS*g(n)
+        # For UNDISCOVERED nodes: use random init (like Dijkstra)
+        d_prime_discovered = (g_curr + h_vals - h_start - EPS * g_curr) * scale_factor
         
-        s[mask_loops] = ranks[instance.edge_index[0][mask_loops]]
+        # Blend: discovered nodes get proper d', undiscovered get random
+        node_scalars = np.where(disc_mask, d_prime_discovered, init_random)
+        
+        s[mask_loops] = node_scalars[instance.edge_index[0][mask_loops]]
         return s
 
-    # Setup Start Node
+    # Setup Start Node: discovered with g(start) = 0
     g_score[instance.start] = 0
-    f_score_raw[instance.start] = h_vals[instance.start]
+    discovered[instance.start] = True
     in_open[instance.start] = 1
 
     # Initial Push
     push_states(
         node_states, edge_states, scalars,
         (in_open, in_closed, is_goal), (pointers, self_loops),
-        (compute_current_scalars(g_score, f_score_raw),),
+        (compute_current_scalars(g_score, discovered),),
         edge_index=instance.edge_index,
     )
 
     for _ in range(n):
         # --- 7. SELECTION LOGIC WITH TIE-BREAKING ---
-        # We perform argmin on the RANK, not just raw F.
-        # This ensures Python selection matches the Network's gradient signal.
-        current_ranks = f_score_raw - (EPS * g_score)
+        # Selection based on f = g + h, with tie-breaking via EPS
+        # We compute: f - EPS*g = g + h - EPS*g = (1-EPS)*g + h
+        f_for_selection = g_score + h_vals
+        current_ranks = f_for_selection - (EPS * g_score)
         
         candidates = current_ranks + (1.0 - in_open) * 1e9 
         
@@ -524,7 +546,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
             push_states(
                 node_states, edge_states, scalars,
                 (in_open, in_closed, is_goal), (pointers, self_loops),
-                (compute_current_scalars(g_score, f_score_raw),),
+                (compute_current_scalars(g_score, discovered),),
                 edge_index=instance.edge_index,
             )
             break
@@ -541,13 +563,13 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
                 pointers[neighbor] = np.zeros(n, dtype=np.int32)
                 pointers[neighbor][current] = 1
                 g_score[neighbor] = tentative_g
-                f_score_raw[neighbor] = g_score[neighbor] + h_vals[neighbor]
+                discovered[neighbor] = True  # Mark as discovered
                 in_open[neighbor] = 1
         
         push_states(
             node_states, edge_states, scalars,
             (in_open, in_closed, is_goal), (pointers, self_loops),
-            (compute_current_scalars(g_score, f_score_raw),),
+            (compute_current_scalars(g_score, discovered),),
             edge_index=instance.edge_index,
         )
 
@@ -557,7 +579,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
         push_states(
             node_states, edge_states, scalars,
             (in_open, in_closed, is_goal), (pointers, self_loops),
-            (compute_current_scalars(g_score, f_score_raw),),
+            (compute_current_scalars(g_score, discovered),),
             edge_index=instance.edge_index,
         )
         
@@ -874,7 +896,7 @@ class GeometricGraphSampler:
 
         #add tiny bit of noise to break symmetries
         if final_n > 1:
-            noise = np.random.uniform(1.00001, 1.0001, size=final_adj.shape) #use additive noise, otherwise weights can become zero in the original
+            noise = np.random.uniform(1.0001, 1.001, size=final_adj.shape) #use additive noise, otherwise weights can become zero in the original
             final_adj = final_adj * noise
             final_adj = (final_adj + final_adj.T) / 2 # Ensure symmetry
         
@@ -940,7 +962,7 @@ class GridGraphSampler:
 
         #add tiny bit of noise to break symmetries
         if N > 1:
-            noise = np.random.uniform(1.00001, 1.0001, size=adj.shape)
+            noise = np.random.uniform(1.0001, 1.001, size=adj.shape)
             adj = adj * noise
             adj = (adj + adj.T) / 2 # Ensure symmetry
 
@@ -1096,7 +1118,7 @@ def _worker_logic_chunk(args):
                 if config.algorithm == 'a_star':
                     node_fts, edge_fts, scalars = algorithm(
                         instance, 
-                        build_full_tree=False, 
+                        build_full_tree=True, 
                         pad_len=config.problem_size[split]
                     )
                 else:
@@ -1138,9 +1160,9 @@ def create_dataloader_distributed(config, split: str, seed: int, num_workers: in
     
     # Determine number of workers (default: use 1/3 of CPUs to be cluster-friendly)
     if num_workers is None:
-        num_workers = max(1, os.cpu_count() // 3)
+        num_workers = max(1, os.cpu_count() // 4)
     else:
-        num_workers = min(num_workers, os.cpu_count()//2)
+        num_workers = min(num_workers, os.cpu_count()//4)
 
     target_node_states = max(config.num_node_states, MAX_NODE_STATES)
     target_edge_states = max(config.num_edge_states, MAX_EDGE_STATES)
@@ -1324,7 +1346,7 @@ def _lazy_generate_sample(args):
 
     # 2. Run algorithm (NumPy outputs)
     if algorithm_name == 'a_star':
-        node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=False, pad_len=problem_size)
+        node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=True, pad_len=problem_size)
     else:
         node_fts, edge_fts, scalars = algorithm(instance)
 
@@ -1499,7 +1521,6 @@ class LazyDataset(Dataset):
         
         # State
         futures = set()
-        # buffer = [] # REMOVED local var
         self.buffer = [] # ADDED Instance var for access during timeout save
         self.next_submit_idx = 0  # Track next index to submit (for checkpoint resume)
         
@@ -2015,7 +2036,7 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
 
         if config.algorithm == 'a_star':
             # A* needs pos for heuristic
-            node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=False, pad_len = config.problem_size[split])
+            node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=True, pad_len = config.problem_size[split])
         else:
             node_fts, edge_fts, scalars = algorithm(instance)
 
