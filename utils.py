@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional, Any, overload
 import numpy as np
 import torch
+import tqdm
 from torch_geometric.utils import group_argsort, scatter, softmax
 import time
 import os
@@ -128,7 +129,7 @@ def score(data, batched_prediction, calculators, output_type) -> Dict[str, float
             )
     return scores
 
-def evaluate(model, dataloader, calculators) -> tuple[Dict[str, float], float]:    
+def evaluate(model, dataloader, calculators, show_progress=False) -> tuple[Dict[str, float], float]:    
     """
     Evaluate the model on a dataset.
 
@@ -144,16 +145,21 @@ def evaluate(model, dataloader, calculators) -> tuple[Dict[str, float], float]:
     total_loss = 0.0
     device = model.parameters().__next__().device
 
-    for data in dataloader:
-        data = data.to(device)
-        batched_prediction, batched_loss = model(data, training_step=-1)
-        data_list = data.to_data_list()
-        total_loss += batched_loss.detach().item() * len(data_list)
-        total_points += len(data_list)
-        # print(len(data_list))
-        score_batch = score(data, batched_prediction, calculators, model.output_type)
-        for calculator in calculators:
-            scores[calculator.__name__] += score_batch[calculator.__name__]
+    with tqdm.tqdm(total=320 if show_progress else 0, disable=not show_progress, desc="Evaluating") as pbar:
+
+        for data in dataloader:
+            data = data.to(device)
+            batched_prediction, batched_loss = model(data, training_step=-1)
+            data_list = data.to_data_list()
+            total_loss += batched_loss.detach().item() * len(data_list)
+            total_points += len(data_list)
+            # print(len(data_list))
+            score_batch = score(data, batched_prediction, calculators, model.output_type)
+            for calculator in calculators:
+                scores[calculator.__name__] += score_batch[calculator.__name__]
+
+            pbar.update(len(data_list))
+        
         
     for calculator in calculators:
         scores[calculator.__name__] /= total_points
@@ -1540,7 +1546,7 @@ def get_least_used_gpus(mig:int=0) -> list[int|str]:
     Get list of GPU IDs sorted by usage (least used first).
     Falls back to all GPUs if nvidia-smi is not available.
     """
-    preferences= [1, 1e5, 1, 1]
+    preferences= [1, 1, 10, 1]
 
     if not mig:
         try:

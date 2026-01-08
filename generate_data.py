@@ -7,12 +7,16 @@ import tqdm
 from torch.utils.data import Dataset,DataLoader
 from torch_geometric.data import Data, Batch
 from scipy.spatial import distance_matrix
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 import pickle
 import hashlib
 import json
 import time
 from pathlib import Path
 from typing import Optional, List
+import atexit
+import weakref
 
 from configs import base_config
 import argparse
@@ -44,10 +48,25 @@ class ProblemInstance:
             self.pos = random_pos[np.argsort(random_pos)]
 
 def push_states(
-    node_states, edge_states, scalars, cur_step_nodes, cur_step_edges, cur_step_scalars
+    node_states, edge_states, scalars, cur_step_nodes, cur_step_edges, cur_step_scalars, edge_index=None
 ):
+    """Push algorithm states for one timestep.
+    
+    MEMORY OPTIMIZATION: If edge_index is provided, immediately extract edge values
+    from n×n matrices instead of storing full matrices. This reduces memory from
+    O(n²) to O(E) per timestep, critical for large graphs.
+    """
     node_states.append(np.stack(cur_step_nodes, axis=-1))
-    edge_states.append(np.stack(cur_step_edges, axis=-1))
+    
+    if edge_index is not None:
+        # Extract edge values immediately - don't store full n×n matrices!
+        # This is the key optimization: O(E) instead of O(n²) per step
+        edge_vals = [m[edge_index[0], edge_index[1]] for m in cur_step_edges]
+        edge_states.append(np.stack(edge_vals, axis=-1))
+    else:
+        # Legacy path (shouldn't be used for large graphs)
+        edge_states.append(np.stack(cur_step_edges, axis=-1))
+    
     scalars.append(np.stack(cur_step_scalars, axis=-1))
 
 # Helper to keep legacy algorithms (BFS/DFS) from crashing on 2D inputs
@@ -68,9 +87,9 @@ def bfs(instance: ProblemInstance):
     edge_states = []
     scalars = []
 
-    visited = np.zeros(n, dtype=np.int32)
-    pointers = np.eye(n, dtype=np.int32)
-    self_loops = np.eye(n, dtype=np.int32)
+    visited = np.zeros(n, dtype=np.int16)
+    pointers = np.eye(n, dtype=np.int16)
+    self_loops = np.eye(n, dtype=np.int16)
 
     # Use helper for 2D compatibility
     cur_scalars = get_scalar_pos_for_legacy(instance)[instance.edge_index[0]]
@@ -80,6 +99,7 @@ def bfs(instance: ProblemInstance):
     push_states(
         node_states, edge_states, scalars,
         (visited,), (pointers, self_loops), (cur_scalars,),
+        edge_index=instance.edge_index,
     )
 
     layer = [instance.start]
@@ -99,12 +119,14 @@ def bfs(instance: ProblemInstance):
         push_states(
             node_states, edge_states, scalars,
             (visited,), (pointers, self_loops), (cur_scalars,),
+            edge_index=instance.edge_index,
         )
 
     while len(node_states) < n:
         push_states(
             node_states, edge_states, scalars,
             (visited,), (pointers, self_loops), (cur_scalars,),
+            edge_index=instance.edge_index,
         )
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
@@ -134,19 +156,35 @@ def dfs(instance: ProblemInstance):
         (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
         (pointers, stack_update, self_loops),
         (cur_scalars,),
+        edge_index=instance.edge_index,
     )
 
-    def rec_dfs(current_node, prev_node=-1):
-        for out in instance.out_nodes[current_node]:
+    # Iterative DFS Stack: (current_node, parent_node, child_iterator_index)
+    # We use explicit index tracking to know where to resume in the children list
+    stack = []
+    stack.append([instance.start, -1, 0]) # Mutable list for in-place index update
+
+    while stack:
+        current_node, prev_node, child_idx = stack[-1]
+        children = instance.out_nodes[current_node]
+
+        if child_idx < len(children):
+            # Advance index for next time
+            out = children[child_idx]
+            stack[-1][2] += 1
+            
             if not_in_the_stack[out]:
+                # === 1. PRE-RECURSION (Arrival at out) ===
                 in_the_stack[current_node] = 1
                 stack_update[current_node][out] = 1
                 push_states(
                     node_states, edge_states, scalars,
                     (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
                     (pointers, stack_update, self_loops), (cur_scalars,),
+                    edge_index=instance.edge_index,
                 )
                 stack_update[current_node][out] = 0
+                
                 top_of_the_stack[current_node] = 0
                 top_of_the_stack[out] = 1
                 not_in_the_stack[out] = 0
@@ -157,30 +195,47 @@ def dfs(instance: ProblemInstance):
                     node_states, edge_states, scalars,
                     (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
                     (pointers, stack_update, self_loops), (cur_scalars,),
+                    edge_index=instance.edge_index,
                 )
                 stack_update[out][current_node] = 0
-                rec_dfs(out, current_node)
-                top_of_the_stack[current_node] = 1
-                top_of_the_stack[out] = 0
-                in_the_stack[current_node] = 0
-                pre_end[out] = 0
-                stack_update[current_node][out] = 1
+                
+                # Push child
+                stack.append([out, current_node, 0])
+        else:
+            # All children processed, return from node
+            stack.pop()
+            
+            # === 3. FINAL NODE UPDATE (Equivalent to end of recurse function) ===
+            pre_end[current_node] = 1
+            stack_update[current_node][current_node] = 1
+            push_states(
+                node_states, edge_states, scalars,
+                (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
+                (pointers, stack_update, self_loops), (cur_scalars,),
+                edge_index=instance.edge_index,
+            )
+            stack_update[current_node][current_node] = 0
+            
+            # === 2. POST-RECURSION (Return to parent) ===
+            # We do this AFTER popping child, affecting the PARENT
+            if prev_node != -1:
+                # Map vars: current_node -> prev_node (parent), out -> current_node (child)
+                parent = prev_node
+                child = current_node
+                
+                top_of_the_stack[parent] = 1
+                top_of_the_stack[child] = 0
+                in_the_stack[parent] = 0
+                pre_end[child] = 0
+                stack_update[parent][child] = 1
                 push_states(
                     node_states, edge_states, scalars,
                     (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
                     (pointers, stack_update, self_loops), (cur_scalars,),
+                    edge_index=instance.edge_index,
                 )
-                stack_update[current_node][out] = 0
-        pre_end[current_node] = 1
-        stack_update[current_node][current_node] = 1
-        push_states(
-            node_states, edge_states, scalars,
-            (not_in_the_stack, top_of_the_stack, in_the_stack, pre_end),
-            (pointers, stack_update, self_loops), (cur_scalars,),
-        )
-        stack_update[current_node][current_node] = 0
+                stack_update[parent][child] = 0
 
-    rec_dfs(instance.start)
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 
@@ -212,6 +267,7 @@ def mst(instance: ProblemInstance):
         node_states, edge_states, scalars,
         (in_queue, in_tree), (pointers, self_loops),
         (compute_current_scalars(node_scalars),),
+        edge_index=instance.edge_index,
     )
 
     for _ in range(1, n):
@@ -235,6 +291,7 @@ def mst(instance: ProblemInstance):
             node_states, edge_states, scalars,
             (in_queue, in_tree), (pointers, self_loops),
             (compute_current_scalars(node_scalars),),
+            edge_index=instance.edge_index,
         )
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
@@ -259,6 +316,7 @@ def mis(instance: ProblemInstance):
     push_states(
         node_states, edge_states, scalars,
         (in_mis, alive), (self_loops,), (compute_current_scalars(),),
+        edge_index=instance.edge_index,
     )
     
     while np.any(alive):
@@ -282,6 +340,7 @@ def mis(instance: ProblemInstance):
         push_states(
             node_states, edge_states, scalars,
             (in_mis, alive), (self_loops,), (compute_current_scalars(),),
+            edge_index=instance.edge_index,
         )
 
         new_alive = np.copy(alive)
@@ -297,12 +356,14 @@ def mis(instance: ProblemInstance):
         push_states(
             node_states, edge_states, scalars,
             (in_mis, alive), (self_loops,), (compute_current_scalars(),),
+            edge_index=instance.edge_index,
         )
 
     while len(node_states) < n:
         push_states(
             node_states, edge_states, scalars,
             (in_mis, alive), (self_loops,), (compute_current_scalars(),),
+            edge_index=instance.edge_index,
         )
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
@@ -336,6 +397,7 @@ def dijkstra(instance: ProblemInstance):
         (in_queue, in_tree),
         (pointers, self_loops),
         (compute_current_scalars(node_scalars),),
+        edge_index=instance.edge_index,
     )
 
     for _ in range(1, n):
@@ -362,6 +424,7 @@ def dijkstra(instance: ProblemInstance):
             (in_queue, in_tree),
             (pointers, self_loops),
             (compute_current_scalars(node_scalars),),
+            edge_index=instance.edge_index,
         )
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
@@ -437,7 +500,8 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     push_states(
         node_states, edge_states, scalars,
         (in_open, in_closed, is_goal), (pointers, self_loops),
-        (compute_current_scalars(g_score, f_score_raw),), #returns one score which is 
+        (compute_current_scalars(g_score, f_score_raw),),
+        edge_index=instance.edge_index,
     )
 
     for _ in range(n):
@@ -461,6 +525,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
                 node_states, edge_states, scalars,
                 (in_open, in_closed, is_goal), (pointers, self_loops),
                 (compute_current_scalars(g_score, f_score_raw),),
+                edge_index=instance.edge_index,
             )
             break
 
@@ -483,6 +548,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
             node_states, edge_states, scalars,
             (in_open, in_closed, is_goal), (pointers, self_loops),
             (compute_current_scalars(g_score, f_score_raw),),
+            edge_index=instance.edge_index,
         )
 
     # if build_full_tree:
@@ -492,6 +558,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
             node_states, edge_states, scalars,
             (in_open, in_closed, is_goal), (pointers, self_loops),
             (compute_current_scalars(g_score, f_score_raw),),
+            edge_index=instance.edge_index,
         )
         
     return np.array(node_states), np.array(edge_states), np.array(scalars)
@@ -581,6 +648,7 @@ def eccentricity(instance: ProblemInstance):
         node_states, edge_states, scalars,
         (visited, msg_phase), (tree_to_pointers(), self_loops),
         (compute_current_scalars(),),
+        edge_index=instance.edge_index,
     )
     
     done = False
@@ -657,6 +725,7 @@ def eccentricity(instance: ProblemInstance):
             node_states, edge_states, scalars,
             (visited, msg_phase), (tree_to_pointers(), self_loops),
             (compute_current_scalars(),),
+            edge_index=instance.edge_index,
         )
     
     # Pad to n steps
@@ -665,6 +734,7 @@ def eccentricity(instance: ProblemInstance):
             node_states, edge_states, scalars,
             (visited, msg_phase), (tree_to_pointers(), self_loops),
             (compute_current_scalars(),),
+            edge_index=instance.edge_index,
         )
     
     return np.array(node_states), np.array(edge_states), np.array(scalars)
@@ -739,13 +809,10 @@ class ErdosRenyiGraphSampler:
 
             goal = (start + 1) % num_nodes # Dummy
             
-            # Pass the 1D positions so A* calculates correct h(n)
-            instance = ProblemInstance(adj, start, goal, self.weighted, random_numbers, pos=pos)
-            
-            # Connectivity check (BFS)
-            trace, _, _ = bfs(instance)
-            if np.all(trace[-1, :, 0] == 1):
-                return instance
+            # Connectivity check (Scipy) - Faster than BFS simulation
+            n_components = connected_components(csr_matrix(adj), directed=False, return_labels=False)
+            if n_components == 1:
+                return ProblemInstance(adj, start, goal, self.weighted, random_numbers, pos=pos)
 
 class GeometricGraphSampler:
     """
@@ -978,7 +1045,10 @@ ALGORITHMS = {
     "eccentricity": eccentricity, #==eccentricity of source node (max shorttest distance to reach any other node)
 }
 import sys
-import ray
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import queue
+from threading import Thread, Lock
+import os
 
 def _pad_features(tensor: torch.Tensor, target_features: int) -> torch.Tensor:
     """Pad the feature dimension (last dim) of a tensor with zeros."""
@@ -989,9 +1059,9 @@ def _pad_features(tensor: torch.Tensor, target_features: int) -> torch.Tensor:
     padding = torch.zeros(*tensor.shape[:-1], pad_size, dtype=tensor.dtype)
     return torch.cat([tensor, padding], dim=-1)
 
-# Pure Python function that processes a CHUNK of samples (no decorators yet)
+# Pure Python function that processes a CHUNK of samples
 def _worker_logic_chunk(args):
-    """Process a chunk of samples in a single worker to reduce Ray overhead."""
+    """Process a chunk of samples in a single worker."""
     try:
         base_seed, config_dict, split, target_node_states, target_edge_states, num_samples_in_chunk = args
         
@@ -1033,9 +1103,10 @@ def _worker_logic_chunk(args):
                     node_fts, edge_fts, scalars = algorithm(instance)
 
                 # Format Data (Numpy-side)
+                # edge_fts is now already edge-indexed (T, E, F) thanks to optimized push_states
                 edge_index = instance.edge_index
-                node_fts = np.transpose(node_fts, (1, 0, 2)) 
-                edge_fts_selected = np.transpose(edge_fts[:, edge_index[0], edge_index[1]], (1, 0, 2))
+                node_fts = np.transpose(node_fts, (1, 0, 2))  # (N, T, F)
+                edge_fts_selected = np.transpose(edge_fts, (1, 0, 2))  # Already (E, T, F)
                 scalars = np.transpose(scalars, (1, 0, 2))
 
                 results.append({
@@ -1057,72 +1128,94 @@ def _worker_logic_chunk(args):
     except Exception as e:
         return [{'error': str(e)}]
 
-# Define Ray Remote Function for chunked processing
-@ray.remote
-def _ray_worker_chunk(args):
-    return _worker_logic_chunk(args)
 
 def create_dataloader_distributed(config, split: str, seed: int, num_workers: int = None):
     """
-    Generates dataset using RAY with chunked processing for efficiency.
-    Each Ray task processes multiple samples to reduce scheduling overhead.
+    Generates dataset using multiprocessing with chunked processing for efficiency.
+    Each worker processes multiple samples to reduce overhead.
     """
-    # 1. Initialize Ray if not already running
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
-
     num_samples = config.num_samples[split]
     
-    # Determine number of workers = number of chunks (one chunk per core)
+    # Determine number of workers (default: use 1/3 of CPUs to be cluster-friendly)
     if num_workers is None:
-        num_workers = max(1, int(ray.available_resources().get('CPU', 4)))
-    
-    # Number of chunks equals number of cores for optimal parallelism
-    num_chunks = num_workers
-    chunk_size = (num_samples + num_chunks - 1) // num_chunks
-    
+        num_workers = max(1, os.cpu_count() // 3)
+    else:
+        num_workers = min(num_workers, os.cpu_count()//2)
+
     target_node_states = max(config.num_node_states, MAX_NODE_STATES)
     target_edge_states = max(config.num_edge_states, MAX_EDGE_STATES)
     config_dict = vars(config) if hasattr(config, '__dict__') else config.__dict__
     
-    # 2. Launch Chunked Tasks
-    print(f"Generating {num_samples} samples with Ray ({num_chunks} chunks of ~{chunk_size} samples each)...")
-    
-    futures = []
-    samples_assigned = 0
-    for chunk_idx in range(num_chunks):
-        samples_in_this_chunk = min(chunk_size, num_samples - samples_assigned)
-        if samples_in_this_chunk <= 0:
-            break
-        # Use seed * large_stride + offset to create non-overlapping seed chains per dataset
-        # This ensures seed=40 and seed=41 don't overlap even with many samples
-        chunk_base_seed = seed * 100000 + samples_assigned
+    if num_workers>1:
+        # Adaptive chunk sizing based on graph size to limit memory per worker
+        # Each sample at size n uses ~(n * n * n * 4 * 2 / 1e9) GB for edge_fts before optimization
+        # After optimization: ~(n * E * 2 * 4 / 1e9) GB where E ≈ n * log(n) * 3
+        problem_size = config.problem_size[split]
+        estimated_edges = int(problem_size * math.log(problem_size) * 3)
+        bytes_per_sample = (
+            problem_size * problem_size * 4 * 4 +  # node_fts: (N, T, F)
+            estimated_edges * problem_size * 2 * 4  # edge_fts: (E, T, F)
+        )
+        gb_per_sample = bytes_per_sample / 1e9
         
-        task_args = (chunk_base_seed, config_dict, split, target_node_states, target_edge_states, samples_in_this_chunk)
-        futures.append(_ray_worker_chunk.remote(task_args))
-        samples_assigned += samples_in_this_chunk
-
-    # 3. Collect Results with Progress Bar
-    datapoints = []
-    unfinished = futures
-    samples_processed = 0
-    
-    with tqdm.tqdm(total=num_samples, desc="Ray Generation") as pbar:
-        while unfinished:
-            # Wait for chunks to complete (batch of results at once)
-            done, unfinished = ray.wait(unfinished, num_returns=1, timeout=None)
+        # Target max ~500MB per worker to stay safe
+        max_samples_per_chunk = max(1, int(0.5 / gb_per_sample))
+        
+        # Calculate chunks needed
+        chunk_size = min(max_samples_per_chunk, (num_samples + num_workers - 1) // num_workers)
+        num_chunks = (num_samples + chunk_size - 1) // chunk_size
+        
+        # Build task arguments
+        print(f"Generating {num_samples} samples with {num_workers} workers")
+        print(f"  Graph size: {problem_size}, ~{gb_per_sample:.2f} GB/sample -> max {max_samples_per_chunk} samples/chunk")
+        print(f"  Using {num_chunks} chunks of {chunk_size} samples each...")
+        
+        task_args_list = []
+        samples_assigned = 0
+        for chunk_idx in range(num_chunks):
+            samples_in_this_chunk = min(chunk_size, num_samples - samples_assigned)
+            if samples_in_this_chunk <= 0:
+                break
+            # Use seed * large_stride + offset to create non-overlapping seed chains per dataset
+            chunk_base_seed = seed * 100000 + samples_assigned
             
-            for future in done:
-                try:
-                    chunk_results = ray.get(future)
-                    for result in chunk_results:
-                        data = _process_worker_result(result)
-                        if data:
-                            datapoints.append(data)
-                        samples_processed += 1
-                        pbar.update(1)
-                except Exception as e:
-                    print(f"Chunk failure: {e}")
+            task_args = (chunk_base_seed, config_dict, split, target_node_states, target_edge_states, samples_in_this_chunk)
+            task_args_list.append(task_args)
+            samples_assigned += samples_in_this_chunk
+
+        # Use ProcessPoolExecutor with fork context for efficiency (no GIL, shared memory for read-only data)
+        datapoints = []
+        
+        # Use 'fork' on Linux for faster startup (avoids re-importing modules)
+        import multiprocessing as mp_module
+        ctx = mp_module.get_context('fork')
+        
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
+            # Submit all chunks
+            future_to_chunk = {executor.submit(_worker_logic_chunk, args): i for i, args in enumerate(task_args_list)}
+            
+            with tqdm.tqdm(total=num_samples, desc="Generating") as pbar:
+                for future in as_completed(future_to_chunk):
+                    try:
+                        chunk_results = future.result()
+                        for result in chunk_results:
+                            data = _process_worker_result(result)
+                            if data:
+                                datapoints.append(data)
+                            pbar.update(1)
+                    except Exception as e:
+                        print(f"Chunk failure: {e}")
+    else: #sequential
+        print(f"Generating {num_samples} samples sequentially...")
+        datapoints = []
+        with tqdm.tqdm(total=num_samples, desc="Generating") as pbar:
+            task_args = (seed * 100000, config_dict, split, target_node_states, target_edge_states, num_samples)
+            chunk_results = _worker_logic_chunk(task_args)
+            for result in chunk_results:
+                data = _process_worker_result(result)
+                if data:
+                    datapoints.append(data)
+                pbar.update(1)
 
     return datapoints
 
@@ -1155,9 +1248,14 @@ def _process_worker_result(result):
     )
 
 def create_dataloader(config: base_config.Config, split: str, seed: int, device, num_workers: int = None):
-    # 1. LAZY LOADING
-    if config.use_lazy_dataset:
-        if num_workers is None: num_workers = 0 
+    # 1. LAZY LOADING (force for large graphs to avoid memory issues)
+    problem_size = config.problem_size[split]
+    force_lazy = problem_size >= 500  # Auto-enable lazy for large graphs
+    
+    if config.use_lazy_dataset or force_lazy:
+        if num_workers is None: num_workers = 0
+        if force_lazy:
+            print(f"Auto-enabling LazyDataset for large graph (n={problem_size}) to avoid memory issues")
         return create_lazy_dataloader(config, split, seed, device, num_workers=num_workers)
 
     # 2. CACHED
@@ -1169,7 +1267,7 @@ def create_dataloader(config: base_config.Config, split: str, seed: int, device,
         if datapoints is not None:
             return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True, collate_fn=pad_and_collate)
 
-    # 3. GENERATE (Using Ray)
+    # 3. GENERATE FRESH
     start_time = time.time()
     datapoints = create_dataloader_distributed(config, split, seed, num_workers=num_workers)
     
@@ -1183,58 +1281,173 @@ def create_dataloader(config: base_config.Config, split: str, seed: int, device,
     return DataLoader(datapoints, batch_size=config.batch_size, shuffle=True, collate_fn=pad_and_collate)
 
 
+def _lazy_generate_sample(args):
+    """
+    Standalone function for generating a sample - can be pickled for multiprocessing.
+    Takes a tuple: (idx, problem_size, algorithm_name, sampler_type, sampler_config, num_node_states, num_edge_states, output_type, output_idx, seed)
+    """
+    if len(args) == 10:
+        (idx, problem_size, algorithm_name, graph_type, config_dict, 
+         num_node_states, num_edge_states, output_type, output_idx, seed) = args
+    else:
+        # Backward compatibility or fallback
+        (idx, problem_size, algorithm_name, graph_type, config_dict, 
+         num_node_states, num_edge_states, output_type, output_idx) = args
+        seed = None
+    
+    # print(f"    [Worker {idx}] Starting generation...")
+    # Set seed for reproducibility
+    # If explicit seed provided (e.g. from eval loop), use it as base.
+    if seed is not None:
+        np.random.seed(seed + idx)
+    else:
+        np.random.seed(idx + hash(algorithm_name) % 2**31)
+    
+    # Reconstruct sampler (can't pickle samplers directly)
+    class SimpleConfig:
+        def __init__(self, d): self.__dict__ = d
+    config = SimpleConfig(config_dict)
+    
+    if graph_type == 'grid':
+        sampler = GridGraphSampler(config)
+    elif graph_type == 'roadmap':
+        sampler = RoadmapGraphSampler(config)
+    elif graph_type == 'geometric':
+        sampler = GeometricGraphSampler(config)
+    else:
+        sampler = ErdosRenyiGraphSampler(config)
+    
+    algorithm = ALGORITHMS[algorithm_name]
+    
+    # 1. Generate instance
+    instance = sampler(problem_size)
+
+    # 2. Run algorithm (NumPy outputs)
+    if algorithm_name == 'a_star':
+        node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=False, pad_len=problem_size)
+    else:
+        node_fts, edge_fts, scalars = algorithm(instance)
+
+    # 3. Prepare raw CPU arrays ONLY
+    edge_index = instance.edge_index.astype(np.int64)
+
+    node_fts = np.transpose(node_fts, (1, 0, 2))  # (N, T, F)
+    edge_fts = np.transpose(edge_fts, (1, 0, 2))  # (E, T, F)
+    scalars = np.transpose(scalars, (1, 0, 2))
+
+    # 4. Pad features (multitask safety)
+    node_fts = _pad_features(torch.from_numpy(node_fts), num_node_states).numpy()
+    edge_fts = _pad_features(torch.from_numpy(edge_fts), num_edge_states).numpy()
+
+    output_fts = edge_fts if output_type == "pointer" else node_fts
+    y = output_fts[:, -1, output_idx]
+
+    print(f"    [Worker {idx}] Completed generation")
+    return {
+        "node_fts": node_fts,
+        "edge_fts": edge_fts,
+        "scalars": scalars,
+        "edge_index": edge_index,
+        "y": y,
+        "pos": instance.pos,
+        "goal": instance.goal,
+        "sample_idx": idx # Return the index for tracking!
+    }
+
+
+
+# Global registry for cleanup
+_active_lazydatasets = weakref.WeakSet()
+
+def _cleanup_lazydatasets():
+    for ds in _active_lazydatasets:
+        ds.shutdown()
+
+atexit.register(_cleanup_lazydatasets)
+
 class LazyDataset(Dataset):
-    def __init__(self, config, split, sampler, algorithm):
+    """
+    LazyDataset with simple prefetching using ProcessPoolExecutor.
+    
+    Refactored to support robust buffered streaming with variable batch sizes.
+    It separates generation from consumption order (yields whatever is ready).
+    """
+    def __init__(self, config, split, sampler, algorithm, num_prefetch_workers=0, start_idx=0, num_samples_override=None, seed=None, preloaded_buffer=None):
         super().__init__()
+        _active_lazydatasets.add(self)
         self.config = config
         self.split = split
         self.sampler = sampler
         self.algorithm = algorithm
-        self.num_samples = config.num_samples[split]
+        self.num_samples = num_samples_override if num_samples_override is not None else config.num_samples[split]
         self.problem_size = config.problem_size[split]
-        self.cache = {}
+        self.start_idx = start_idx
+        self.seed = seed
+        self.preloaded_buffer = preloaded_buffer if preloaded_buffer is not None else []
+        
+        # Store config as dict for pickling to worker processes
+        self.graph_type = getattr(config, 'graph_type', 'er')
+        self.config_dict = vars(config) if hasattr(config, '__dict__') else config.__dict__
+        
+        # Prefetching setup
+        self.num_prefetch_workers = num_prefetch_workers if self.problem_size >= 400 else 0
+        self.executor = None
+        
+        if self.num_prefetch_workers > 0:
+            print(f"LazyDataset: Using {self.num_prefetch_workers} prefetch workers (samples {start_idx}..{start_idx+self.num_samples-1})")
+            import multiprocessing as mp_module
+            # Use 'fork' context on Linux for efficiency
+            # Fallback to spawn if needed, but fork is faster for read-only config sharing
+            try:
+                ctx = mp_module.get_context('fork')
+                self.executor = ProcessPoolExecutor(max_workers=self.num_prefetch_workers, mp_context=ctx)
+            except ValueError:
+                self.executor = ProcessPoolExecutor(max_workers=self.num_prefetch_workers)
 
-    def __len__(self):
-        return self.num_samples
+    def shutdown(self):
+        """Force shutdown of the executor to free memory."""
+        if self.executor:
+            # print("Shutting down LazyDataset executor...")
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor = None
 
-    def __getitem__(self, idx):
-        if idx not in self.cache:
-            # 1. Generate instance
-            instance = self.sampler(self.problem_size)
+    def __del__(self):
+        self.shutdown()
 
-            # 2. Run algorithm (NumPy outputs)
-            node_fts, edge_fts, scalars = self.algorithm(instance)
+    def _make_worker_args(self, idx):
+        """Create picklable args tuple for _lazy_generate_sample.
+        
+        idx is the logical sample index within this dataset's num_samples range.
+        For preloaded samples (idx < len(preloaded_buffer)), we don't call this.
+        For new samples (idx >= len(preloaded_buffer)), we generate at:
+            start_idx + idx
+        This correctly handles resumption where preloaded samples were already
+        at indices [start_idx, start_idx + len(preloaded_buffer)).
+        """
+        return (
+            self.start_idx + idx,
+            self.problem_size,
+            self.config.algorithm,
+            self.graph_type,
+            self.config_dict,
+            self.config.num_node_states,
+            self.config.num_edge_states,
+            self.config.output_type,
+            self.config.output_idx,
+            self.seed  # Pass seed explicitly
+        )
 
-            # 3. Prepare raw CPU arrays ONLY
-            edge_index = instance.edge_index.astype(np.int64)
-
-            node_fts = np.transpose(node_fts, (1, 0, 2))  # (T, N, F)
-            edge_fts = np.transpose(
-                edge_fts[:, edge_index[0], edge_index[1]], (1, 0, 2)
-            )
-            scalars = np.transpose(scalars, (1, 0, 2))
-
-            # 4. Pad features (multitask safety)
-            node_fts = _pad_features(torch.from_numpy(node_fts), self.config.num_node_states).numpy()
-            edge_fts = _pad_features(torch.from_numpy(edge_fts), self.config.num_edge_states).numpy()
-
-            output_fts = edge_fts if self.config.output_type == "pointer" else node_fts
-            y = output_fts[:, -1, self.config.output_idx]
-
-            # 5. Cache RAW DATA ONLY
-            self.cache[idx] = {
-                "node_fts": node_fts,
-                "edge_fts": edge_fts,
-                "scalars": scalars,
-                "edge_index": edge_index,
-                "y": y,
-                "pos": instance.pos,
-                "goal": instance.goal,
-            }
-
-        c = self.cache[idx]
-
-        # 6. Rebuild PyG Data (fresh, CPU, safe)
+    def _to_data(self, c):
+        """Convert result dict to PyG Data object."""
+        # Note: goal must be 1-d tensor for PyG collation to work properly
+        goal_val = c["goal"]
+        if isinstance(goal_val, (int, float)):
+            goal_tensor = torch.tensor([goal_val], dtype=torch.long)
+        else:
+            goal_tensor = torch.tensor(goal_val, dtype=torch.long)
+            if goal_tensor.dim() == 0:
+                goal_tensor = goal_tensor.unsqueeze(0)
+        
         return Data(
             node_fts=torch.tensor(c["node_fts"], dtype=torch.float32),
             edge_fts=torch.tensor(c["edge_fts"], dtype=torch.float32),
@@ -1242,8 +1455,191 @@ class LazyDataset(Dataset):
             edge_index=torch.tensor(c["edge_index"], dtype=torch.long),
             y=torch.tensor(c["y"], dtype=torch.long),
             pos=torch.tensor(c["pos"], dtype=torch.float32),
-            goal=torch.tensor(c["goal"], dtype=torch.long),
+            goal=goal_tensor,
         )
+    
+    def iter_batches_as_ready(self, max_batch_size=None, min_batch_size=1):
+        """
+        Stream batches of ready samples.
+        
+        Design:
+        - Keeps a pool of active futures.
+        - Yields batches as soon as `min_batch_size` items are ready.
+        - Respects `max_batch_size` to avoid GPU OOM.
+        - Automatically manages prefetching to keep workers busy.
+        - Order of samples is NOT preserved (yields whatever finishes first).
+        """
+        # Sequential fallback with preloaded buffer handling
+        if self.executor is None:
+            batch = []
+            
+            # 1. Yield preloaded
+            if self.preloaded_buffer:
+                for item_dict in self.preloaded_buffer:
+                    batch.append(self._to_data(item_dict))
+                    if max_batch_size and len(batch) >= max_batch_size:
+                        yield pad_and_collate(batch)
+                        batch = []
+            
+            # 2. Yield new samples
+            # Adjust range to skip preloaded count
+            start = len(self.preloaded_buffer)
+            for idx in range(start, self.num_samples):
+                c = _lazy_generate_sample(self._make_worker_args(idx))
+                batch.append(self._to_data(c))
+                if max_batch_size and len(batch) >= max_batch_size:
+                    yield pad_and_collate(batch)
+                    batch = []
+            if batch:
+                yield pad_and_collate(batch)
+            return
+
+        # Parallel Streaming Logic
+        import concurrent.futures
+        
+        # State
+        futures = set()
+        # buffer = [] # REMOVED local var
+        self.buffer = [] # ADDED Instance var for access during timeout save
+        self.next_submit_idx = 0  # Track next index to submit (for checkpoint resume)
+        
+        # === Inject Preloaded Buffer ===
+        # Preloaded samples are already generated - they count toward num_samples
+        # We need to generate (num_samples - len(preloaded_buffer)) NEW samples
+        if self.preloaded_buffer:
+             print(f"LazyDataset: Injecting {len(self.preloaded_buffer)} preloaded samples into buffer.")
+             for item in self.preloaded_buffer:
+                 # Convert dicts to Data objects (preferred path from checkpoint)
+                 if isinstance(item, dict):
+                    self.buffer.append(self._to_data(item))
+                 else:
+                    # Legacy: Data object directly - convert to dict and back to ensure consistent format
+                    item_dict = {
+                        'node_fts': item.node_fts.numpy() if hasattr(item.node_fts, 'numpy') else item.node_fts,
+                        'edge_fts': item.edge_fts.numpy() if hasattr(item.edge_fts, 'numpy') else item.edge_fts,
+                        'scalars': item.scalars.numpy() if hasattr(item.scalars, 'numpy') else item.scalars,
+                        'edge_index': item.edge_index.numpy() if hasattr(item.edge_index, 'numpy') else item.edge_index,
+                        'y': item.y.numpy() if hasattr(item.y, 'numpy') else item.y,
+                        'pos': item.pos.numpy() if hasattr(item.pos, 'numpy') else item.pos,
+                        'goal': int(item.goal.item()) if item.goal.dim() == 0 else int(item.goal[0].item()),
+                    }
+                    self.buffer.append(self._to_data(item_dict))
+        
+        # next_submit_idx is RELATIVE to start_idx, indicating how many we've submitted
+        # Preloaded samples count as already submitted
+        self.next_submit_idx = len(self.preloaded_buffer)
+        returned_count = 0
+        
+        print(f"LazyDataset: Will yield {self.num_samples} samples ({len(self.preloaded_buffer)} preloaded, {self.num_samples - len(self.preloaded_buffer)} to generate)")
+        
+        # Target number of pending tasks (2x workers to hide latency)
+        target_in_flight = self.num_prefetch_workers * 2
+        
+        # How many NEW samples to generate (excluding preloaded)
+        samples_to_generate = self.num_samples - len(self.preloaded_buffer)
+        
+        def submit_tasks():
+            # Only submit if total in flight (running + buffered) is below limit
+            # This prevents memory explosion if consumer is slow
+            # next_submit_idx counts from 0 to samples_to_generate (not including preloaded)
+            while (len(futures) + len(self.buffer)) < target_in_flight and self.next_submit_idx < self.num_samples:
+                # The actual sample index is: start_idx + preloaded_count + (next_submit_idx - preloaded_count)
+                # Simplified: start_idx + next_submit_idx - preloaded_count + preloaded_count = start_idx + next_submit_idx - preloaded_count + preloaded_count
+                # Actually we want: new samples start at index (start_idx + len(preloaded_buffer))
+                actual_idx = self.next_submit_idx
+                args = self._make_worker_args(actual_idx)
+                f = self.executor.submit(_lazy_generate_sample, args)
+                futures.add(f)
+                self.next_submit_idx += 1
+
+        # Initial fill
+        submit_tasks()
+        
+        while returned_count < self.num_samples:
+            # 1. Check for completed futures (non-blocking initially, then short wait)
+            # Use a short timeout to allow responsive checking without busy-waiting
+            wait_time = 0 if self.buffer else 0.1  # Don't wait if buffer has data to yield
+            done, not_done = concurrent.futures.wait(futures, timeout=wait_time, return_when=concurrent.futures.FIRST_COMPLETED if futures else concurrent.futures.ALL_COMPLETED)
+            
+            # 2. Process completed tasks immediately - add to buffer right away
+            for f in done:
+                futures.remove(f)
+                try:
+                    res = f.result()
+                    self.buffer.append(self._to_data(res))
+                except Exception as e:
+                    print(f"Generation error: {e}")
+                    # In case of error, we still count it as 'processed' to ensure termination
+                    returned_count += 1
+            
+            # 3. Yield batches if we have enough data (or if we are finishing up)
+            # Logic: Yield if >= min_batch_size OR (no more futures coming AND buffer has data)
+            is_finishing = (self.next_submit_idx >= self.num_samples and not futures)
+            threshold = 1 if is_finishing else min_batch_size
+            
+            while len(self.buffer) >= threshold:
+                # Determine batch size
+                take_n = len(self.buffer)
+                if max_batch_size:
+                    take_n = min(take_n, max_batch_size)
+                
+                # Extract batch (copy the items, don't slice-assign)
+                batch_data = self.buffer[:take_n]
+                
+                # Remove yielded items from buffer IN-PLACE *BEFORE* YIELDING
+                # This ensures that if the consumer manipulates the buffer (e.g. for checkpointing),
+                # we don't interfere with their state when we resume.
+                del self.buffer[:take_n]
+                
+                # Debug: log batch sizes to diagnose collation issues
+                if len(batch_data) > 0:
+                    sample_shapes = {
+                        'node_fts': batch_data[0].node_fts.shape,
+                        'edge_fts': batch_data[0].edge_fts.shape,
+                    }
+                    print(f"  [LazyDataset] Collating batch of {take_n} samples (shapes: N={sample_shapes['node_fts']}, E={sample_shapes['edge_fts']})...")
+                
+                # Yield
+                yield pad_and_collate(batch_data)
+                returned_count += len(batch_data)
+                
+                # If we emptied buffer below next threshold, stop yielding
+                if len(self.buffer) < threshold:
+                    break
+            
+            # 4. Refill pipe
+            submit_tasks()
+            
+            # Verify termination condition
+            if is_finishing and not self.buffer:
+                break
+    
+    def iter_as_ready(self):
+        """Deprecated: Use iter_batches_as_ready instead."""
+        for batch in self.iter_batches_as_ready(max_batch_size=1, min_batch_size=1):
+            yield batch.get_example(0)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        if self.executor is not None:
+             print(f"Warning: Random access __getitem__({idx}) called on LazyDataset. "
+                   "This bypasses the streaming optimization and may match existing futures poorly.")
+             
+             # Simple fallback: generate locally or via submit -> wait
+             # Since we are refactoring for eval, let's keep it simple: blocking generate
+             c = _lazy_generate_sample(self._make_worker_args(idx))
+             return self._to_data(c)
+        else:
+            # No prefetching - generate directly
+            c = _lazy_generate_sample(self._make_worker_args(idx))
+            return self._to_data(c)
+    
+    def __del__(self):
+        """Clean up executor on deletion."""
+        if self.executor is not None:
+            self.executor.shutdown(wait=False)
 
 def create_lazy_dataloader(config, split, seed, device, num_workers=0):
     np.random.seed(seed)
@@ -1261,7 +1657,18 @@ def create_lazy_dataloader(config, split, seed, device, num_workers=0):
         
     algorithm = ALGORITHMS[config.algorithm]
 
-    dataset = LazyDataset(config, split, sampler, algorithm)
+    # For large graphs, use prefetch workers for parallel generation
+    # This keeps at most num_prefetch_workers * 2 samples in RAM (~48 * 500MB = 24GB max)
+    problem_size = config.problem_size[split]
+    if problem_size >= 400:
+        # Use num_workers for prefetching, DataLoader workers=0 (no redundant parallelism)
+        num_prefetch_workers = num_workers if num_workers > 0 else max(1, (os.cpu_count() or 1) // 3)
+        dataset = LazyDataset(config, split, sampler, algorithm, num_prefetch_workers=num_prefetch_workers)
+        dataloader_workers = 0  # Prefetching handles parallelism
+    else:
+        # Small graphs: use standard DataLoader workers
+        dataset = LazyDataset(config, split, sampler, algorithm, num_prefetch_workers=0)
+        dataloader_workers = num_workers
 
     def seed_worker(worker_id):
         worker_seed = (seed + worker_id) % 2**32
@@ -1274,8 +1681,8 @@ def create_lazy_dataloader(config, split, seed, device, num_workers=0):
         dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        worker_init_fn=seed_worker,
+        num_workers=dataloader_workers,
+        worker_init_fn=seed_worker if dataloader_workers > 0 else None,
         collate_fn=pad_and_collate,
     )
 
@@ -1324,7 +1731,9 @@ def get_cache_path(config, split: str, seed: int) -> Path:
 
 
 def save_dataset_to_cache(datapoints: List[Data], cache_path: Path, seed: int):
-    """Save generated dataset to disk with metadata."""
+    """Save generated dataset to disk with metadata and exclusive locking."""
+    import fcntl
+    
     try:
         # Move data to CPU before saving to avoid GPU memory issues
         cpu_datapoints = [data.cpu() for data in datapoints]
@@ -1337,22 +1746,52 @@ def save_dataset_to_cache(datapoints: List[Data], cache_path: Path, seed: int):
             'timestamp': time.time(),
         }
         
+        # Use exclusive lock during write to prevent corruption
         with open(cache_path, 'wb') as f:
-            pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         
         print(f"Dataset cached to: {cache_path} (seed={seed}, n={len(cpu_datapoints)})")
     except Exception as e:
         print(f"Warning: Failed to cache dataset: {e}")
 
 
-def load_dataset_from_cache(cache_path: Path, device, expected_seed: int) -> Optional[List[Data]]:
-    """Load dataset from disk cache with seed verification."""
+def load_dataset_from_cache(cache_path: Path, device, expected_seed: int, timeout: float = 30.0) -> Optional[List[Data]]:
+    """Load dataset from disk cache with seed verification and lock detection."""
+    import fcntl
+    import errno
+    
     if not cache_path.exists():
         return None
     
     try:
-        with open(cache_path, 'rb') as f:
+        f = open(cache_path, 'rb')
+        
+        # Try to acquire a shared (read) lock with timeout
+        # If another process holds an exclusive lock, this will fail
+        start = time.time()
+        while True:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break  # Got the lock
+            except IOError as e:
+                if e.errno in (errno.EACCES, errno.EAGAIN):
+                    if time.time() - start > timeout:
+                        f.close()
+                        raise TimeoutError(f"Cache file '{cache_path}' is locked by another process. "
+                                           f"Try 'pkill -9 -u $USER -f python' to kill stale processes.")
+                    time.sleep(0.5)
+                else:
+                    raise
+        
+        try:
             cache_data = pickle.load(f)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            f.close()
         
         # Handle both old format (just list) and new format (dict with metadata)
         if isinstance(cache_data, dict):
@@ -1372,6 +1811,8 @@ def load_dataset_from_cache(cache_path: Path, device, expected_seed: int) -> Opt
         
         #not moving to device her, as we handle it in the traning loop
         return datapoints
+    except TimeoutError:
+        raise  # Re-raise lock timeout to caller
     except Exception as e:
         print(f"Warning: Failed to load cached dataset: {e}")
         return None
@@ -1380,88 +1821,151 @@ def load_dataset_from_cache(cache_path: Path, device, expected_seed: int) -> Opt
 def pad_and_collate(batch):
     """
     Pads time and node dimensions so PyG can batch variable-sized graph trajectories.
-    Robustly handles:
-    1. Variable Time Steps (T)
+    Fully vectorized implementation for maximum speed.
+    
+    Handles:
+    1. Variable Time Steps (T) -> Pads to max_T
     2. Variable Node Counts (N) -> Adds Ghost Nodes
-    3. Hybrid Targets (y) -> Detects if y is Node-level (Index) or Edge-level (Mask) and pads accordingly.
+    3. Hybrid Targets (y) -> Detects if y is Node-level or Edge-level
     """
     if not batch:
         return Batch.from_data_list([])
+    
+    B = len(batch)
+    
+    # Fast path: single sample, no padding needed
+    if B == 1:
+        return Batch.from_data_list(batch)
 
-    # Batch shape: (Nodes, Time, Feats)
-    max_N = max(d.node_fts.shape[0] for d in batch)
-    max_T = max(d.node_fts.shape[1] for d in batch)
-
-    padded_list = []
-
-    for d in batch:
-        N, T, F = d.node_fts.shape
-        E_orig = d.edge_fts.shape[0]
-        _, _, EF = d.edge_fts.shape
-        _, _, S_dim = d.scalars.shape
-
-        # 1. Pad node_fts: (N, T, F) -> (max_N, max_T, F)
-        node_pad = torch.zeros((max_N, max_T, F), dtype=d.node_fts.dtype)
-        node_pad[:N, :T, :] = d.node_fts
-
-        # 2. Pad edge_fts: (E, T, F) -> (E, max_T, F) (Time padding only)
-        edge_pad = torch.zeros((E_orig, max_T, EF), dtype=d.edge_fts.dtype)
-        edge_pad[:, :T, :] = d.edge_fts
-
-        # 3. Pad scalars: (E, T, S) -> (E, max_T, S)
-        scalars_pad = torch.zeros((E_orig, max_T, S_dim), dtype=d.scalars.dtype)
-        scalars_pad[:, :T, :] = d.scalars
+    # =====================================================================
+    # PHASE 1: Gather dimensions (vectorized)
+    # =====================================================================
+    Ns = [d.node_fts.shape[0] for d in batch]
+    Ts = [d.node_fts.shape[1] for d in batch]
+    Es = [d.edge_fts.shape[0] for d in batch]
+    
+    max_N = max(Ns)
+    max_T = max(Ts)
+    F = batch[0].node_fts.shape[2]
+    EF = batch[0].edge_fts.shape[2]
+    S_dim = batch[0].scalars.shape[2]
+    
+    # Check if all samples have same dimensions (no padding needed)
+    all_same_N = all(n == max_N for n in Ns)
+    all_same_T = all(t == max_T for t in Ts)
+    
+    if all_same_N and all_same_T:
+        # No padding needed - fast path
+        return Batch.from_data_list(batch)
+    
+    # =====================================================================
+    # PHASE 2: Pre-allocate output tensors for entire batch
+    # =====================================================================
+    # Pre-compute total edges including ghosts
+    ghost_counts = [max_N - n for n in Ns]
+    total_edges = [e + g for e, g in zip(Es, ghost_counts)]
+    
+    # Pre-allocate lists for padded data
+    padded_node_fts = []
+    padded_edge_fts = []
+    padded_scalars = []
+    padded_edge_indices = []
+    padded_ys = []
+    
+    # =====================================================================
+    # PHASE 3: Batch padding with minimal allocations
+    # =====================================================================
+    # Pre-compute ghost indices for each sample (reusable)
+    ghost_indices_cache = {}
+    for num_ghosts in set(ghost_counts):
+        if num_ghosts > 0:
+            start_idx = max_N - num_ghosts
+            ghost_indices_cache[num_ghosts] = torch.arange(start_idx, max_N, dtype=torch.long)
+    
+    for i, d in enumerate(batch):
+        N, T = Ns[i], Ts[i]
+        E_orig = Es[i]
+        num_ghosts = ghost_counts[i]
         
-        current_edge_index = d.edge_index
-        current_y = d.y
-
-        # --- FIX: GHOST NODES INJECTION ---
-        if N < max_N:
-            num_ghosts = max_N - N
-            
-            # A. Create Ghost Topology (Self-Loops)
-            ghost_indices = torch.arange(N, max_N, dtype=torch.long)
-            ghost_loops = torch.stack([ghost_indices, ghost_indices], dim=0)
-            
-            current_edge_index = torch.cat([d.edge_index, ghost_loops], dim=1)
-            
-            # B. Create Ghost Features (Zeros)
-            ghost_edge_attrs = torch.zeros((num_ghosts, max_T, EF), dtype=d.edge_fts.dtype)
-            ghost_scalars = torch.zeros((num_ghosts, max_T, S_dim), dtype=d.scalars.dtype)
-            
-            edge_pad = torch.cat([edge_pad, ghost_edge_attrs], dim=0)
-            scalars_pad = torch.cat([scalars_pad, ghost_scalars], dim=0)
-
-            # C. Pad Ground Truth 'y'
-            # Check if y is Node-Level (size N) or Edge-Level (size E)
-            if d.y is not None:
-                if d.y.shape[0] == N: 
-                    # Node-Level: Pad with Self-Indices
-                    y_pad = torch.zeros((max_N,), dtype=d.y.dtype)
-                    y_pad[:N] = d.y
-                    y_pad[N:] = ghost_indices # Ghosts point to self
-                    current_y = y_pad
-                elif d.y.shape[0] == E_orig:
-                    # Edge-Level: Append labels for the new ghost loops
-                    # Ghosts point to self, so the self-loop edge is TRUE (1)
-                    ghost_labels = torch.ones((num_ghosts,), dtype=d.y.dtype)
-                    current_y = torch.cat([d.y, ghost_labels], dim=0)
-                else:
-                    # Fallback (e.g. Graph-level label): No padding needed usually
-                    pass
-
-        padded_list.append(
-            Data(
-                node_fts=node_pad,
-                edge_fts=edge_pad,
-                scalars=scalars_pad,
-                edge_index=current_edge_index,
-                y=current_y, 
-                pos=d.pos,
-                goal=d.goal,
-                num_nodes=max_N, 
+        # -----------------------------------------------------------------
+        # Node features: use F.pad (optimized C++ implementation)
+        # -----------------------------------------------------------------
+        if N < max_N or T < max_T:
+            node_pad = torch.nn.functional.pad(
+                d.node_fts, 
+                (0, 0, 0, max_T - T, 0, max_N - N),
+                mode='constant', value=0
             )
+        else:
+            node_pad = d.node_fts
+        padded_node_fts.append(node_pad)
+        
+        # -----------------------------------------------------------------
+        # Edge features + Scalars: handle together to minimize allocations
+        # -----------------------------------------------------------------
+        if num_ghosts == 0 and T == max_T:
+            # No changes needed
+            padded_edge_fts.append(d.edge_fts)
+            padded_scalars.append(d.scalars)
+            padded_edge_indices.append(d.edge_index)
+        else:
+            # Pre-allocate combined tensor (original edges + ghost edges)
+            total_E = E_orig + num_ghosts
+            
+            # Allocate with zeros (ghosts will be 0)
+            edge_pad = torch.zeros((total_E, max_T, EF), dtype=d.edge_fts.dtype)
+            scalars_pad = torch.zeros((total_E, max_T, S_dim), dtype=d.scalars.dtype)
+            
+            # Copy original data in one operation
+            edge_pad[:E_orig, :T, :] = d.edge_fts
+            scalars_pad[:E_orig, :T, :] = d.scalars
+            
+            padded_edge_fts.append(edge_pad)
+            padded_scalars.append(scalars_pad)
+            
+            # Edge index: append ghost self-loops
+            if num_ghosts > 0:
+                ghost_idx = ghost_indices_cache[num_ghosts]
+                ghost_loops = torch.stack([ghost_idx, ghost_idx], dim=0)
+                padded_edge_indices.append(torch.cat([d.edge_index, ghost_loops], dim=1))
+            else:
+                padded_edge_indices.append(d.edge_index)
+        
+        # -----------------------------------------------------------------
+        # Y labels: handle padding
+        # -----------------------------------------------------------------
+        if d.y is not None and num_ghosts > 0:
+            if d.y.shape[0] == N:
+                # Node-level labels
+                y_pad = torch.zeros((max_N,), dtype=d.y.dtype)
+                y_pad[:N] = d.y
+                y_pad[N:] = ghost_indices_cache[num_ghosts]
+                padded_ys.append(y_pad)
+            elif d.y.shape[0] == E_orig:
+                # Edge-level labels - ghosts point to self (1)
+                ghost_labels = torch.ones((num_ghosts,), dtype=d.y.dtype)
+                padded_ys.append(torch.cat([d.y, ghost_labels], dim=0))
+            else:
+                padded_ys.append(d.y)
+        else:
+            padded_ys.append(d.y)
+    
+    # =====================================================================
+    # PHASE 4: Create Data objects and batch
+    # =====================================================================
+    padded_list = [
+        Data(
+            node_fts=padded_node_fts[i],
+            edge_fts=padded_edge_fts[i],
+            scalars=padded_scalars[i],
+            edge_index=padded_edge_indices[i],
+            y=padded_ys[i], 
+            pos=batch[i].pos,
+            goal=batch[i].goal,
+            num_nodes=max_N, 
         )
+        for i in range(B)
+    ]
 
     return Batch.from_data_list(padded_list)
 
@@ -1518,10 +2022,9 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
         edge_index = torch.tensor(instance.edge_index).contiguous()
 
         # Reshape to (Batch/Time, Nodes, Feats)
+        # edge_fts is now already edge-indexed (T, E, F) thanks to optimized push_states
         node_fts = torch.transpose(torch.tensor(node_fts), 0, 1)
-        edge_fts = torch.transpose(
-            torch.tensor(edge_fts)[:, edge_index[0], edge_index[1]], 0, 1
-        )
+        edge_fts = torch.transpose(torch.tensor(edge_fts), 0, 1)  # Already (E, T, F)
         scalars = torch.transpose(torch.tensor(scalars), 0, 1)
         
         # Pad features to expected dimensions
@@ -1590,7 +2093,7 @@ def clear_cache(algorithm: Optional[str] = None, graph_type: Optional[str] = Non
         print("Cleared entire cache")
 
 
-def get_cache_info():
+def get_cache_info(config):
     """Print information about cached datasets."""
     cache_dir = Path(getattr(config, 'cache_directory', 'data_cache'))
     
@@ -1679,8 +2182,14 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--seed", "-s",
         type=int,
-        default=42,
+        default=42**2,
         help="Random seed for data generation.",
+    )
+    argparser.add_argument(
+        "--size", "-sz",
+        type=int, 
+        default=-1,
+        help="The size of the graphs to generate. Overrides the config!",
     )
 
     argparser.add_argument('--clear', action='store_true', help='Clear cache')
@@ -1690,26 +2199,29 @@ if __name__ == "__main__":
 
     args = argparser.parse_args()
 
-    if args.info or (not args.clear):
-        get_cache_info()
+    #check if its a valid config file
+    if not os.path.exists(args.config):
+        raise FileNotFoundError(f"Config file {args.config} not found.")
+
+    config = base_config.read_config(args.config)
+
+    if args.info and (not args.clear):
+        get_cache_info(config)
         exit()
     
     if args.clear:
         clear_cache(args.algorithm, args.graph_type)
         exit()
 
-    #check if its a valid config file
-    if not os.path.exists(args.config):
-        raise FileNotFoundError(f"Config file {args.config} not found.")
-    
-
     config = base_config.read_config(args.config)
+    config.problem_size = {"test": args.size}
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if config.use_lazy_dataset:
-        data = create_lazy_dataloader(config, "val", seed=args.seed, device=device) #remember to put this onto the device later after getting the batch
+        data = create_lazy_dataloader(config, "test", seed=args.seed, device=device) #remember to put this onto the device later after getting the batch
     else:
-        data = create_dataloader(config, "val", seed=args.seed, device=device)
+        #this will also cache the data
+        data = create_dataloader(config, "test", seed=args.seed, device=device)
 
     for batch in data:
         print(batch.node_fts[:, -1:, 0].sum() / 32)

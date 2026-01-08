@@ -371,7 +371,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
                     metric_name = "pointer_accuracy_graph_level" if config.output_type == "pointer" else "node_mask_accuracy_graph_level"
                     current_score = val_scores.get(metric_name, 0.0)
 
-                    if (steps >= config.min_iterations or current_score==1.0) and session.check_early_stopping(current_score):
+                    if (steps >= config.min_iterations and current_score==1.0) and session.check_early_stopping(current_score):
                         print(f"\nEarly stopping triggered! (Val Acc: {current_score:.4f})")
                         training_interrupted = True
                         early_stopped = True

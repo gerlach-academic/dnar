@@ -1,5 +1,7 @@
 algorithm: mis
 
+learning_rate: 0.001
+
 # --- data ---
 num_samples:
   train: 10000
