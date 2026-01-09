@@ -466,9 +466,10 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     g_score = np.zeros(n, dtype=np.float32)
     discovered = np.zeros(n, dtype=bool)
     
-    # Random initialization for undiscovered nodes - EXACTLY like Dijkstra uses instance.pos
-    # NO SCALING - match Dijkstra exactly
-    init_random = instance.pos[:, 0].astype(np.float32) if instance.pos.ndim == 2 else instance.pos.copy().astype(np.float32)
+    # Random initialization for undiscovered nodes - EXACTLY like Dijkstra
+    # Generate fresh sorted random values (like ER graphs do) for consistency
+    random_pos = np.random.uniform(0.0, 1.0, (n,))
+    init_random = random_pos[np.argsort(random_pos)].astype(np.float32)
     
     # --- 4. HINT PHYSICS SETUP ---
     # Edge Hint: Potential Function w' = w - h(u) + h(v)
@@ -1410,8 +1411,9 @@ class LazyDataset(Dataset):
             import multiprocessing as mp_module
             # Use 'fork' context on Linux for efficiency
             # Fallback to spawn if needed, but fork is faster for read-only config sharing
+            #DEBUG: try spawn for now
             try:
-                ctx = mp_module.get_context('fork')
+                ctx = mp_module.get_context('spawn')
                 self.executor = ProcessPoolExecutor(max_workers=self.num_prefetch_workers, mp_context=ctx)
             except ValueError:
                 self.executor = ProcessPoolExecutor(max_workers=self.num_prefetch_workers)
@@ -1673,7 +1675,7 @@ def create_lazy_dataloader(config, split, seed, device, num_workers=0):
     problem_size = config.problem_size[split]
     if problem_size >= 400:
         # Use num_workers for prefetching, DataLoader workers=0 (no redundant parallelism)
-        num_prefetch_workers = num_workers if num_workers > 0 else max(1, (os.cpu_count() or 1) // 3)
+        num_prefetch_workers = num_workers if num_workers > 0 else max(1, (os.cpu_count() or 1) // 4)
         dataset = LazyDataset(config, split, sampler, algorithm, num_prefetch_workers=num_prefetch_workers)
         dataloader_workers = 0  # Prefetching handles parallelism
     else:
