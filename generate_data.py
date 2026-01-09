@@ -478,8 +478,9 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     discovered = np.zeros(n, dtype=bool)
     
     # Random initialization for undiscovered nodes - matches Dijkstra's instance.pos pattern
-    # Use the same random values Dijkstra would use
-    init_random = instance.pos[:, 0] if instance.pos.ndim == 2 else instance.pos.copy()
+    ## Generate fresh sorted random values (like ER graphs do) for consistency
+    random_pos = np.random.uniform(0.0, 1.0, (n,))
+    init_random = random_pos[np.argsort(random_pos)].astype(np.float32)
     
     # --- 5. HINT PHYSICS SETUP ---
     # Edge Hint: Potential Function w' = w - h(u) + h(v)
