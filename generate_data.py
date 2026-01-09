@@ -1403,7 +1403,8 @@ class LazyDataset(Dataset):
         self.config_dict = vars(config) if hasattr(config, '__dict__') else config.__dict__
         
         # Prefetching setup
-        self.num_prefetch_workers = num_prefetch_workers if self.problem_size >= 400 else 0
+        # Respect user's explicit num_prefetch_workers value (including 0 for no multiprocessing)
+        self.num_prefetch_workers = num_prefetch_workers
         self.executor = None
         
         if self.num_prefetch_workers > 0:
@@ -1499,13 +1500,55 @@ class LazyDataset(Dataset):
             # Adjust range to skip preloaded count
             start = len(self.preloaded_buffer)
             for idx in range(start, self.num_samples):
+                # Memory check before generation
+                # if (idx - start) % 1 == 0:  # Check every sample
+                #     try:
+                #         import psutil
+                #         import gc
+                #         process = psutil.Process()
+                #         mem_gb = process.memory_info().rss / 1024**3
+                #         print(f"[LazyDataset] Before generating sample {idx+1}/{self.num_samples}: {mem_gb:.2f} GB, batch_size={len(batch)}")
+                #     except:
+                #         pass
+                
                 c = _lazy_generate_sample(self._make_worker_args(idx))
-                batch.append(self._to_data(c))
+                data_obj = self._to_data(c)
+                
+                # Explicitly delete the raw result dict to free memory
+                del c
+                
+                # Memory check after generation
+                # if (idx - start) % 1 == 0:  # Check every sample
+                #     try:
+                #         import psutil
+                #         import gc
+                #         process = psutil.Process()
+                #         mem_gb = process.memory_info().rss / 1024**3
+                #         print(f"[LazyDataset] After generating sample {idx+1}/{self.num_samples}: {mem_gb:.2f} GB")
+                #     except:
+                #         pass
+                
+                batch.append(data_obj)
+                
+                # CRITICAL: For large graphs, yield immediately (don't accumulate in batch)
+                # DFS on size=800 creates ~0.5-0.8 GB per sample, so we can't hold many
+                should_yield = False
                 if max_batch_size and len(batch) >= max_batch_size:
+                    should_yield = True
+                elif self.problem_size >= 600 and len(batch) >= 1:
+                    # For very large graphs, yield after EVERY sample to avoid OOM
+                    should_yield = True
+                
+                if should_yield:
                     yield pad_and_collate(batch)
+                    del batch
                     batch = []
+                    # gc.collect()  # Force cleanup
+            
             if batch:
                 yield pad_and_collate(batch)
+                del batch
+                # gc.collect()
             return
 
         # Parallel Streaming Logic
@@ -1580,6 +1623,16 @@ class LazyDataset(Dataset):
                 try:
                     res = f.result()
                     self.buffer.append(self._to_data(res))
+                    
+                    # Memory check after adding to buffer
+                    # if len(self.buffer) % 2 == 0:  # Check every 2 samples
+                    #     try:
+                    #         import psutil
+                    #         process = psutil.Process()
+                    #         mem_gb = process.memory_info().rss / 1024**3
+                    #         print(f"  [LazyDataset] Buffer size: {len(self.buffer)}, Memory: {mem_gb:.2f} GB")
+                    #     except:
+                    #         pass
                 except Exception as e:
                     print(f"Generation error: {e}")
                     # In case of error, we still count it as 'processed' to ensure termination
@@ -1610,11 +1663,34 @@ class LazyDataset(Dataset):
                         'node_fts': batch_data[0].node_fts.shape,
                         'edge_fts': batch_data[0].edge_fts.shape,
                     }
+                    # Memory check
+                    # try:
+                    #     import psutil
+                    #     process = psutil.Process()
+                    #     mem_gb = process.memory_info().rss / 1024**3
+                    #     print(f"  [LazyDataset] Before collation: {mem_gb:.2f} GB, Collating batch of {take_n} samples (shapes: N={sample_shapes['node_fts']}, E={sample_shapes['edge_fts']})...")
+                    # except:
+                    #     pass
                     print(f"  [LazyDataset] Collating batch of {take_n} samples (shapes: N={sample_shapes['node_fts']}, E={sample_shapes['edge_fts']})...")
                 
                 # Yield
-                yield pad_and_collate(batch_data)
+                collated_batch = pad_and_collate(batch_data)
+                
+                # Memory check after collation
+                # try:
+                #     import psutil
+                #     process = psutil.Process()
+                #     mem_gb = process.memory_info().rss / 1024**3
+                #     print(f"  [LazyDataset] After collation: {mem_gb:.2f} GB\")")
+                # except:
+                #     pass
+                
+                yield collated_batch
                 returned_count += len(batch_data)
+                
+                # Clean up references
+                del batch_data
+                del collated_batch
                 
                 # If we emptied buffer below next threshold, stop yielding
                 if len(self.buffer) < threshold:

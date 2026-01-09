@@ -13,7 +13,18 @@ import pickle
 import time
 from collections import defaultdict
 from torch_geometric.data import Batch
+import psutil
+import gc
 os.environ["RAY_DISABLE_METRICS"] = "1"
+
+def print_memory(label=""):
+    """Print current memory usage."""
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info()
+    gb_rss = mem.rss / 1024**3
+    gb_vms = mem.vms / 1024**3
+    print(f"[MEM {label}] RSS: {gb_rss:.2f} GB, VMS: {gb_vms:.2f} GB")
+    return gb_rss
 
 def eval_worker(seed: int, config_dict: dict, model_path: str, gpu_id: int):
     """
@@ -377,11 +388,13 @@ if __name__ == "__main__":
                 model_losses = partial_state['model_losses']
                 total_points = partial_state['processed_count']
                  
-                # The 'buffered_samples' list contains raw sample dicts we saved at checkpoint
-                if 'buffered_samples' in partial_state:
-                    preloaded_buffer = partial_state['buffered_samples']
-
-                # Calculate remaining samples to yield (including preloaded buffer)
+                # CRITICAL: Clear buffered samples to avoid memory issues
+                # Regenerate them instead of unpickling potentially large/corrupted data
+                print(f">> WARNING: Discarding {len(partial_state.get('buffered_samples', []))} buffered samples from checkpoint")
+                print(f">>          They will be regenerated (prevents memory/corruption issues)")
+                preloaded_buffer = []  # Force empty - regenerate instead
+                
+                # Calculate remaining samples to yield
                 num_samples_override = total_samples - start_sample_idx
                 
                 # Validation: ensure consistency
@@ -404,8 +417,12 @@ if __name__ == "__main__":
 
             torch.manual_seed(seed)
             
+            # print_memory("Before creating dataset")
+            # gc.collect()
+            
             # Create lazy dataset with prefetching - use iter_as_ready() for maximum throughput
-            cpu_count = (os.cpu_count() or 4) // 4
+            # cpu_count = 0 #debug , 
+            cpu_count = os.cpu_count()//4
             from generate_data import LazyDataset, ALGORITHMS, ErdosRenyiGraphSampler, GridGraphSampler, RoadmapGraphSampler, GeometricGraphSampler
             import numpy as np
             np.random.seed(seed)
@@ -423,6 +440,8 @@ if __name__ == "__main__":
             algorithm = ALGORITHMS[config_obj.algorithm]
             dataset = LazyDataset(config_obj, split, sampler, algorithm, num_prefetch_workers=cpu_count, seed=seed, start_idx=start_sample_idx, num_samples_override=num_samples_override, preloaded_buffer=preloaded_buffer)
             
+            # print_memory("After creating dataset")
+            
             # Accumulators per model (now handled in if/else above)
             # model_scores = {mp: defaultdict(float) for mp in models}
             # model_losses = {mp: 0.0 for mp in models}
@@ -436,8 +455,8 @@ if __name__ == "__main__":
             if config_obj.algorithm == 'dfs' and args.size >= 600:
                 # DFS has very long traces (~4000 steps for n=800)
                 # But with optimized F.pad collation, we can handle moderate batches
-                dynamic_max_batch = 16  # Balance speed vs memory
-                dynamic_min_batch = 8
+                dynamic_max_batch = 2  # Balance speed vs memory
+                dynamic_min_batch = 1
                 print(f"  Using reduced batch sizes for DFS (max={dynamic_max_batch}, min={dynamic_min_batch}) due to long traces")
             
             with torch.no_grad():
@@ -448,8 +467,12 @@ if __name__ == "__main__":
                 )
                 
                 for batch in batch_iterator:
+                    # print_memory(f"After receiving batch")
+                    
                     # Save current batch BEFORE processing in case we're forced to yield during processing
                     current_batch_samples = batch.to_data_list()
+                    
+                    # print_memory(f"After batch.to_data_list()")
                     
                     # Check timeout BEFORE processing the batch
                     if args.timeout > 0 and (time.time() - start_time) / 60 > args.timeout:
@@ -471,6 +494,7 @@ if __name__ == "__main__":
                     batch_size = len(current_batch_samples)
                     total_points += batch_size
                     
+                    # print_memory(f"After batch.to(device)")
                     print(f"  Starting on batch of {batch_size} samples (total: {total_points}/{total_samples})")
 
                     # Evaluate ALL models on this batch
@@ -485,6 +509,13 @@ if __name__ == "__main__":
                             model_scores[model_path][calc.__name__] += score_batch[calc.__name__]
                     
                     print(f"  Processed batch of {batch_size} samples (total: {total_points})")
+                    
+                    # Clean up batch memory
+                    del batch
+                    del current_batch_samples
+                    # torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    # gc.collect()
+                    # print_memory(f"After cleanup")
                     
                     # Remove processed batch from buffer (modify in-place)
                     if hasattr(dataset, 'buffer'):
