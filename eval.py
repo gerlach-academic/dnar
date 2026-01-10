@@ -281,36 +281,52 @@ if __name__ == "__main__":
 
         config_dict = vars(config) if hasattr(config, '__dict__') else config.__dict__
 
-        # We use ONE process per GPU to avoid "CUDA device busy" errors and memory oversubscription.
-        ctx = mp.get_context('spawn')
         num_procs = min(num_eval_workers, min(len(gpus), len(seeds) * len(model_paths)))
-        # gpus = gpus[::-1][:num_procs]  # Reverse to distribute load better
-        if args.gpu >=0 and args.gpu < num_devices:
-            gpus = [args.gpu] * num_procs
-            print(f"Using specified GPU ID {args.gpu} for all eval workers.")
-        else:
-            gpus = [3,2,1,0][:num_procs]  # Manually set GPU order
-        print(f"Starting evaluation pool with {num_procs} processes...")
-        
-        with ctx.Pool(processes=num_procs) as pool:
-            tasks = []
-            for i, (model_path, seed) in enumerate([(m, s) for m in model_paths for s in seeds]):
-                gpu_id = gpus[i % len(gpus)]
-                tasks.append(pool.apply_async(
-                    eval_worker, 
-                    args=(seed, config_dict, str(model_path), gpu_id)
-                ))
+
+        if num_procs > 1:
+            print(f">> Using multiprocessing with {num_procs} processes for evaluation...")
+
+            # We use ONE process per GPU to avoid "CUDA device busy" errors and memory oversubscription.
+            ctx = mp.get_context('spawn')
             
+            # gpus = gpus[::-1][:num_procs]  # Reverse to distribute load better
+            if args.gpu >=0 and args.gpu < num_devices:
+                gpus = [args.gpu] * num_procs
+                print(f"Using specified GPU ID {args.gpu} for all eval workers.")
+            else:
+                gpus = [3,2,1,0][:num_procs]  # Manually set GPU order
+            print(f"Starting evaluation pool with {num_procs} processes...")
+            
+            with ctx.Pool(processes=num_procs) as pool:
+                tasks = []
+                for i, (model_path, seed) in enumerate([(m, s) for m in model_paths for s in seeds]):
+                    gpu_id = gpus[i % len(gpus)]
+                    tasks.append(pool.apply_async(
+                        eval_worker, 
+                        args=(seed, config_dict, str(model_path), gpu_id)
+                    ))
+                
+                results = []
+                for i, task in tqdm.tqdm(enumerate(tasks), desc="Evaluating", total=len(tasks)):
+                    try:
+                        res = task.get()
+                        if 'error' in res:
+                            print(f"Error: {res['error']}")
+                        else:
+                            results.append(res)
+                    except Exception as e:
+                        print(f"Task Crash: {e}")
+        else: # Single process
+            print(f">> Using single process for evaluation...")
             results = []
-            for i, task in tqdm.tqdm(enumerate(tasks), desc="Evaluating", total=len(tasks)):
-                try:
-                    res = task.get()
+            for model_path in model_paths:
+                for seed in seeds:
+                    res = eval_worker(seed, config_dict, str(model_path), gpus[0])
                     if 'error' in res:
                         print(f"Error: {res['error']}")
                     else:
                         results.append(res)
-                except Exception as e:
-                    print(f"Task Crash: {e}")
+
     else:
         print(f">> Using LazyDataset for large graphs (n={args.size}) - data generated on-the-fly")
         print(f">> Evaluating {len(model_paths)} models on each batch to avoid regenerating data")
@@ -431,7 +447,7 @@ if __name__ == "__main__":
             
             # Create lazy dataset with prefetching - use iter_as_ready() for maximum throughput
             # cpu_count = 0 #debug , 
-            cpu_count = 0 if algorithm in ('dfs', 'a_star') or args.size >=1000 else os.cpu_count()//4 
+            cpu_count = 0 if algorithm in ('dfs', 'a_star') or args.size >=800 else os.cpu_count()//4 
             from generate_data import LazyDataset, ALGORITHMS, ErdosRenyiGraphSampler, GridGraphSampler, RoadmapGraphSampler, GeometricGraphSampler
             import numpy as np
             np.random.seed(seed)
@@ -471,7 +487,12 @@ if __name__ == "__main__":
                 #half the amount
                 dynamic_max_batch = 1
                 dynamic_min_batch = 1
-                print(f"  Using reduced batch sizes for extra large graphs (n={args.size}): (max={dynamic_max_batch}, min={dynamic_min_batch})")
+                print(f"  Using reduced batch sizes for extra/roadmap large graphs (n={args.size}): (max={dynamic_max_batch}, min={dynamic_min_batch})")
+
+            if config_obj.graph_type == 'roadmap':
+                dynamic_max_batch = 16
+                dynamic_min_batch = 16
+                print(f"  Using batch sizes of 16 for large roadmap graphs: (max={dynamic_max_batch}, min={dynamic_min_batch})")
 
             with torch.no_grad():
                 # Manual iteration to check timeout BEFORE fetching next batch

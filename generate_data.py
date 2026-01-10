@@ -26,7 +26,7 @@ import argparse
 # -----------------------------------------------------------------------------
 
 class ProblemInstance:
-    def __init__(self, adj, start, goal, weighted, randomness, pos=None):
+    def __init__(self, adj, start, goal, weighted, randomness, pos=None, scalar_pos=None):
         self.adj = np.copy(adj)
         self.start = start
         self.goal = goal
@@ -44,8 +44,22 @@ class ProblemInstance:
         if pos is not None:
             self.pos = pos
         else:
+            n = adj.shape[0]
             random_pos = np.random.uniform(0.0, 1.0, (n,))
             self.pos = random_pos[np.argsort(random_pos)]
+        
+        # Separate scalar positions for BFS/DFS/Dijkstra/MST hints
+        # These must be 1D sorted values for consistent learning across graph types
+        if scalar_pos is not None:
+            self.scalar_pos = scalar_pos
+        elif self.pos.ndim == 1:
+            self.scalar_pos = self.pos  # Already 1D sorted (ER graphs)
+        else:
+            # 2D positions (Grid/Roadmap): generate fresh sorted 1D scalars
+            # This ensures BFS layer.sort() correlates with scalar values
+            n = adj.shape[0]
+            random_1d = np.random.uniform(0.0, 1.0, (n,))
+            self.scalar_pos = random_1d[np.argsort(random_1d)]
 
 def push_states(
     node_states, edge_states, scalars, cur_step_nodes, cur_step_edges, cur_step_scalars, edge_index=None
@@ -71,11 +85,13 @@ def push_states(
 
 # Helper to keep legacy algorithms (BFS/DFS) from crashing on 2D inputs
 def get_scalar_pos_for_legacy(instance):
-    # If pos is 2D (planning map), just take the first coord for the 'scalar' hint
-    # This keeps dimensions compatible with standard CLRS models.
-    if instance.pos.ndim > 1:
-        return instance.pos[:, 0]
-    return instance.pos
+    """Get 1D sorted scalar positions for BFS/DFS/Dijkstra/MST hints.
+    
+    This ensures all graph types provide the same scalar hint structure:
+    sorted 1D values where lower indices have lower scalar values.
+    This matches how ER graphs work and enables cross-graph-type generalization.
+    """
+    return instance.scalar_pos
 
 # -----------------------------------------------------------------------------
 # 2. ALGORITHMS
@@ -380,7 +396,13 @@ def dijkstra(instance: ProblemInstance):
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    node_scalars = instance.pos
+    # FIX: For geometric graphs, pos is 2D but we need 1D scalars for g-scores
+    # Use a flat copy for the actual g-score tracking
+    if instance.pos.ndim == 1:
+        node_scalars = np.copy(instance.pos)  # 1D: use directly
+    else:
+        # 2D: initialize with x-coordinates (will be overwritten anyway)
+        node_scalars = np.copy(instance.pos[:, 0])
 
     def compute_current_scalars(node_scalars):
         scalars = instance.adj[instance.edge_index[0], instance.edge_index[1]]
@@ -609,6 +631,8 @@ def eccentricity(instance: ProblemInstance):
         
     Scalars:
         - eccentricity estimate (echo_state at source) on self-loops
+
+    NOTE: Instead of random scalar positions for the index order, we really solely on node indices already present, the model learns to use those as IDs.  
     """
     n = instance.adj.shape[0]
     A = instance.adj  # Adjacency matrix
