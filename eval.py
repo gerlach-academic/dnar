@@ -222,12 +222,12 @@ if __name__ == "__main__":
     # ... [Load Config and Model Paths logic is same as before] ...
     if args.config_path:
         config_path = args.config_path
-        algorithm = Path(config_path).stem
     else:
         algorithm = "bfs"
         config_path = f"./configs/{algorithm}.yaml"
     
     config = base_config.read_config(config_path)
+    algorithm = config.algorithm
     split = "test"
     config.problem_size = {split: args.size}
     seeds = [args.seed + i for i in range(args.num_seeds)]
@@ -333,7 +333,7 @@ if __name__ == "__main__":
 
         # Checkpoint path
         user = os.getenv("USER") or "default_user"
-        checkpoint_path = Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{args.size}_{args.seed}.pkl")
+        checkpoint_path = Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{args.size}_{args.seed}.pkl") if config.graph_type == "er" else Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{config.graph_type}_{args.size}_{args.seed}.pkl")
         results = []
         
         # Load checkpoint if exists

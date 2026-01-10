@@ -1041,7 +1041,7 @@ class RoadmapGraphSampler:
 
         # Add tiny noise to break symmetries
         if N > 1:
-            noise = np.random.uniform(1.00001, 1.0001, size=adj.shape)
+            noise = np.random.uniform(1.00001, 1.001, size=adj.shape)
             adj = adj * noise
             adj = (adj + adj.T) / 2 # Ensure symmetry
 

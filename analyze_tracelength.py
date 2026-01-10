@@ -19,6 +19,7 @@ from generate_data import (
     ErdosRenyiGraphSampler, 
     GeometricGraphSampler,
     GridGraphSampler,
+    RoadmapGraphSampler,
     bfs, dfs, dijkstra, a_star, mst,
     get_scalar_pos_for_legacy
 )
@@ -130,38 +131,31 @@ def parallel_dijkstra_trace_length(instance: ProblemInstance, epsilon: float = 0
     return num_buckets + 1  # +1 for initial state
 
 
-def parallel_mst_trace_length(instance: ProblemInstance, epsilon: float = 0.01) -> int:
+def parallel_mst_trace_length(instance: ProblemInstance) -> int:
     """
-    Estimate trace length for parallel MST (Borůvka-style or parallel Kruskal's).
+    Estimate trace length for parallel MST using Borůvka's algorithm.
     
-    In Borůvka's algorithm, each component finds its minimum outgoing edge in parallel.
-    This requires O(log n) iterations in the worst case.
+    Borůvka's algorithm is naturally parallel:
+    1. Each connected component finds its minimum outgoing edge
+    2. All components add their minimum edge simultaneously
+    3. Components merge, repeat until one component remains
     
-    Parallel Kruskal's processes edges in batches by weight buckets.
+    This exploits edge weight ties: components can add edges in parallel
+    even if they have different weights.
+    
+    Time complexity: O(log n) rounds, each round processes components in parallel.
     
     Returns:
-        Estimated number of parallel steps
+        Estimated number of parallel steps (Borůvka rounds)
     """
     n = instance.adj.shape[0]
     
-    # Extract all edges with weights
-    edges = []
-    for i in range(n):
-        for j in range(i+1, n):  # Undirected graph
-            if instance.adj[i, j] > 0:
-                edges.append((instance.adj[i, j], i, j))
-    
-    if not edges:
+    if n == 1:
         return 1
     
-    edges.sort()  # Sort by weight
-    
-    # Find max weight for bucket sizing
-    max_weight = edges[-1][0]
-    delta = max_weight * epsilon
-    
-    # Union-Find structure
+    # Union-Find structure for tracking components
     parent = list(range(n))
+    rank = [0] * n
     
     def find(x):
         if parent[x] != x:
@@ -170,38 +164,65 @@ def parallel_mst_trace_length(instance: ProblemInstance, epsilon: float = 0.01) 
     
     def union(x, y):
         px, py = find(x), find(y)
-        if px != py:
+        if px == py:
+            return False
+        # Union by rank
+        if rank[px] < rank[py]:
             parent[px] = py
-            return True
-        return False
+        elif rank[px] > rank[py]:
+            parent[py] = px
+        else:
+            parent[py] = px
+            rank[px] += 1
+        return True
     
-    # Process edges in buckets (parallel batches)
-    num_steps = 0
+    num_rounds = 1  # Initial state
     edges_added = 0
-    i = 0
     
-    while i < len(edges) and edges_added < n - 1:
-        # Define bucket: all edges within [w, w+delta)
-        bucket_min = edges[i][0]
-        bucket_edges = []
+    # Borůvka's algorithm: iterate until all nodes in one component
+    while edges_added < n - 1:
+        # Find minimum outgoing edge for each component
+        component_min_edge = {}  # component_id -> (weight, u, v)
         
-        j = i
-        while j < len(edges) and edges[j][0] < bucket_min + delta:
-            bucket_edges.append(edges[j])
-            j += 1
+        for i in range(n):
+            for j in range(i + 1, n):
+                if instance.adj[i, j] > 0:
+                    comp_i = find(i)
+                    comp_j = find(j)
+                    
+                    if comp_i != comp_j:
+                        weight = instance.adj[i, j]
+                        # Track minimum edge for component i
+                        if comp_i not in component_min_edge or weight < component_min_edge[comp_i][0]:
+                            component_min_edge[comp_i] = (weight, i, j)
+                        # Track minimum edge for component j
+                        if comp_j not in component_min_edge or weight < component_min_edge[comp_j][0]:
+                            component_min_edge[comp_j] = (weight, i, j)
         
-        # Process all edges in bucket in parallel
-        # In reality, only non-conflicting edges can be added simultaneously
-        for weight, u, v in bucket_edges:
+        if not component_min_edge:
+            break
+        
+        # Add all minimum edges in parallel (one per component)
+        edges_this_round = set()
+        for weight, u, v in component_min_edge.values():
+            # Use tuple with sorted endpoints to avoid duplicates
+            edge_key = tuple(sorted([u, v]))
+            edges_this_round.add(edge_key)
+        
+        # Apply the unions
+        for u, v in edges_this_round:
             if union(u, v):
                 edges_added += 1
-                if edges_added >= n - 1:
-                    break
         
-        num_steps += 1
-        i = j
+        num_rounds += 1
+        
+        # Safety check
+        if num_rounds > 2 * int(np.ceil(np.log2(n))) + 5:
+            # Borůvka should take at most O(log n) rounds
+            print(f"Warning: parallel_mst_trace_length exceeded expected Borůvka rounds for n={n}")
+            break
     
-    return num_steps + 1  # +1 for initial state
+    return num_rounds
 
 
 def parallel_a_star_trace_length(instance: ProblemInstance, epsilon: float = 0.01) -> int:
@@ -330,6 +351,8 @@ def analyze_trace_lengths(
         sampler = GeometricGraphSampler(config)
     elif graph_type == 'grid':
         sampler = GridGraphSampler(config)
+    elif graph_type == 'roadmap':
+        sampler = RoadmapGraphSampler(config)
     else:
         sampler = ErdosRenyiGraphSampler(config)
     
@@ -442,6 +465,10 @@ def plot_results(results: dict, sizes: list, output_path: str = 'trace_length_an
         # Plot O(log n) reference for parallel
         log_ref = np.log2(valid_sizes) * 5  # Scaled for visibility
         ax.plot(valid_sizes, log_ref, ':', color='gray', alpha=0.5, label='O(log n) scaled')
+
+        #Plot O(sqrt(n)) reference 
+        sqrt_ref = np.sqrt(valid_sizes) * 5  # Scaled for visibility
+        ax.plot(valid_sizes, sqrt_ref, '-.', color='gray', alpha=0.5, label='O(√n) scaled')
         
         ax.set_xlabel('Graph Size (n)')
         ax.set_ylabel('Trace Length (steps)')
@@ -450,6 +477,10 @@ def plot_results(results: dict, sizes: list, output_path: str = 'trace_length_an
         ax.set_xscale('log', base=2)
         ax.set_yscale('log', base=2)
         ax.grid(True, alpha=0.3)
+
+        ax.set_xticks(valid_sizes)
+        ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+        ax.get_yaxis().set_major_formatter(plt.ScalarFormatter())
     
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -495,7 +526,7 @@ def main():
                        default=[16, 32, 64, 128, 256, 512],
                        help='Graph sizes to test')
     parser.add_argument('--graph_type', '-g', type=str, default='er',
-                       choices=['er', 'geometric', 'grid'],
+                       choices=['er', 'geometric', 'grid', 'roadmap'],
                        help='Type of graphs to generate')
     parser.add_argument('--num_samples', '-n', type=int, default=20,
                        help='Number of samples per size')
