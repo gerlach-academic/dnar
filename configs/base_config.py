@@ -30,6 +30,8 @@ class Config:
     generate_random_numbers: bool = False
     graph_type: str = "er"
     mp_mode: str = "processes" # how to generate data: sequential or threads or processes
+    #a_star
+    full_tree: bool = True
 
     # --- model ---
     h: int = 128

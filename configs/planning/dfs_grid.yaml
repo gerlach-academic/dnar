@@ -1,0 +1,21 @@
+algorithm: dfs
+graph_type: grid
+
+# --- data ---
+num_samples:
+  train: 10000
+  val: 320
+  test: 320
+
+problem_size:
+  train: 16
+  val: 16
+  test: 64
+
+edge_weights: false
+
+# --- model ---
+# BFS has 1 node state: visited
+num_node_states: 1
+# BFS has 2 edge states: pointers, self_loops
+num_edge_states: 2

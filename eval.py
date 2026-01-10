@@ -240,18 +240,27 @@ if __name__ == "__main__":
     
     model_paths = []
     for model in models:
-        # Check standard path
-        p = Path(f"./out/checkpoints_{model}/model_final.pt")
-        if p.exists():
-            model_paths.append(p)
-            continue
-        # Check step path
-        cp_dir = Path(f"./out/checkpoints_{model}")
-        if cp_dir.exists():
-            steps = list(cp_dir.glob("model_step_*.pt"))
-            if steps:
-                max_step = max([int(f.stem.split("_")[-1]) for f in steps])
-                model_paths.append(cp_dir / f"model_step_{max_step}.pt")
+        if algorithm != "a_star":
+            # Check standard path
+            p = Path(f"./out/checkpoints_{model}/model_final.pt")
+            if p.exists():
+                model_paths.append(p)
+                continue
+            # Check step path
+            cp_dir = Path(f"./out/checkpoints_{model}")
+            if cp_dir.exists():
+                steps = list(cp_dir.glob("model_step_*.pt"))
+                if steps:
+                    max_step = max([int(f.stem.split("_")[-1]) for f in steps])
+                    model_paths.append(cp_dir / f"model_step_{max_step}.pt")
+        else:
+            #check in models dir for the best model
+            p = Path(f"./tmp/models/{model}/{model}_pointer_accuracy_graph_level_best.pt")
+            if p.exists():
+                model_paths.append(p)
+            else:
+                print(f"Model path not found for {model}")
+
 
     if not model_paths:
         print("No models found.")
@@ -262,7 +271,7 @@ if __name__ == "__main__":
 
     # For large graphs (n >= 1000), LazyDataset is auto-enabled and generates on-the-fly.
     # No need to pre-generate data - it would just accumulate in RAM.
-    if args.size < 500:
+    if args.size < 500 and algorithm != "a_star":
         cpu_count = os.cpu_count()//3
         for seed in seeds:
             print(f">> Pre-generating/Caching data for seed {seed}...")
@@ -422,7 +431,7 @@ if __name__ == "__main__":
             
             # Create lazy dataset with prefetching - use iter_as_ready() for maximum throughput
             # cpu_count = 0 #debug , 
-            cpu_count = os.cpu_count()//4
+            cpu_count = 0 if algorithm in ('dfs', 'a_star') or args.size >=1000 else os.cpu_count()//4 
             from generate_data import LazyDataset, ALGORITHMS, ErdosRenyiGraphSampler, GridGraphSampler, RoadmapGraphSampler, GeometricGraphSampler
             import numpy as np
             np.random.seed(seed)
@@ -452,13 +461,18 @@ if __name__ == "__main__":
             # Adaptive batch sizing based on algorithm
             dynamic_max_batch = 64
             dynamic_min_batch = 16
-            if config_obj.algorithm == 'dfs' and args.size >= 600:
+            if config_obj.algorithm in ('dfs', 'a_star') and args.size >= 600:
                 # DFS has very long traces (~4000 steps for n=800)
                 # But with optimized F.pad collation, we can handle moderate batches
-                dynamic_max_batch = 2  # Balance speed vs memory
-                dynamic_min_batch = 1
+                dynamic_max_batch = 8  # Balance speed vs memory
+                dynamic_min_batch = 8
                 print(f"  Using reduced batch sizes for DFS (max={dynamic_max_batch}, min={dynamic_min_batch}) due to long traces")
-            
+            if args.size >=1000:
+                #half the amount
+                dynamic_max_batch = 1
+                dynamic_min_batch = 1
+                print(f"  Using reduced batch sizes for extra large graphs (n={args.size}): (max={dynamic_max_batch}, min={dynamic_min_batch})")
+
             with torch.no_grad():
                 # Manual iteration to check timeout BEFORE fetching next batch
                 batch_iterator = dataset.iter_batches_as_ready(
@@ -485,10 +499,11 @@ if __name__ == "__main__":
                     
                     # Add current batch to buffer BEFORE processing, then checkpoint
                     # Modify in-place so generator sees the change
-                    if hasattr(dataset, 'buffer'):
-                        dataset.buffer[:0] = current_batch_samples  # Prepend in-place
-                    save_checkpoint(dataset, checkpoint_path, results, seed_idx, total_points, model_scores, model_losses)
-                    print(f"  Pre-processing checkpoint: {total_points} processed, {len(dataset.buffer) if hasattr(dataset, 'buffer') else 0} buffered (includes current batch).")
+                    if dynamic_min_batch > 1:
+                        if hasattr(dataset, 'buffer'):
+                            dataset.buffer[:0] = current_batch_samples  # Prepend in-place
+                        save_checkpoint(dataset, checkpoint_path, results, seed_idx, total_points, model_scores, model_losses)
+                        print(f"  Pre-processing checkpoint: {total_points} processed, {len(dataset.buffer) if hasattr(dataset, 'buffer') else 0} buffered (includes current batch).")
                     
                     batch = batch.to(device)
                     batch_size = len(current_batch_samples)
@@ -516,10 +531,18 @@ if __name__ == "__main__":
                     # torch.cuda.empty_cache() if torch.cuda.is_available() else None
                     # gc.collect()
                     # print_memory(f"After cleanup")
-                    
+                    if args.timeout > 0 and (time.time() - start_time) / 60 > args.timeout:
+                        print(f">> Timeout reached. Saving checkpoint with current unprocessed batch.")
+                        # Add current batch to buffer for the checkpoint (modify in-place)
+                        if hasattr(dataset, 'buffer'):
+                            del dataset.buffer[:batch_size]  # Remove first batch_size items in-place
+                        timeout_interrupt = True
+                        break
+
                     # Remove processed batch from buffer (modify in-place)
-                    if hasattr(dataset, 'buffer'):
-                        del dataset.buffer[:batch_size]  # Remove first batch_size items in-place
+                    if dynamic_min_batch > 1:
+                        if hasattr(dataset, 'buffer'):
+                            del dataset.buffer[:batch_size]  # Remove first batch_size items in-place
                     save_checkpoint(dataset, checkpoint_path, results, seed_idx, total_points, model_scores, model_losses)
                     print(f"  Post-processing checkpoint: {total_points} processed, {len(dataset.buffer) if hasattr(dataset, 'buffer') else 0} buffered.")
 

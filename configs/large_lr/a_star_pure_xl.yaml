@@ -1,8 +1,7 @@
 algorithm: a_star
-# full_tree_portion: 0.5
-
+full_tree: false
 graph_type: geometric
-
+learning_rate: 0.003
 # --- data ---
 num_samples:
   train: 10000

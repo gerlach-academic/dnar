@@ -446,20 +446,32 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     pointers = np.eye(n, dtype=np.int32)
     self_loops = np.eye(n, dtype=np.int32)
 
-    # --- 2. Heuristics ---
+    
+    # --- 2. Scaling Factor Calculation ---
+    edge_weights = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+    avg_weight = np.mean(edge_weights)
+    scale_factor = 1.0
+    if avg_weight > 0.5: 
+        scale_factor = 1.0 / math.sqrt(n)
+
+    # --- 3. Heuristics ---
     # For geometric graphs with Euclidean edge weights: Euclidean distance is optimal.
-    # Euclidean heuristic is admissible and consistent (triangle inequality).
+    # For grid graphs with 4-connectivity (unit cost): Manhattan distance is optimal.
+    # For grid graphs with 8-connectivity: Chebyshev or Octile distance.
+    # Current: Euclidean for 2D, L1 for 1D (matches GeometricGraphSampler edge weights)
     if instance.pos.ndim == 2:
         h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
     else:
         h_vals = np.abs(instance.pos - instance.pos[instance.goal])
+    
+    h_start = h_vals[instance.start]  # Constant offset for reduction
 
-    # --- 3. Initialization ---
+    # --- 4. Initialization ---
     # CRITICAL: For true Dijkstra equivalence, undiscovered nodes need random scalars
     # just like Dijkstra uses instance.pos for unvisited nodes.
     # 
     # We track:
-    # - g_score: actual g-values (updated when discovered)
+    # - g_score: actual g-values (0 for undiscovered, updated when discovered)
     # - discovered: mask of which nodes have been reached
     # - init_random: random values for undiscovered nodes (like Dijkstra's instance.pos)
     
@@ -478,14 +490,12 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     h_dst = h_vals[instance.edge_index[1]]
     w_uv = instance.adj[instance.edge_index[0], instance.edge_index[1]]
     
-    # Reduced edge weights - same scale as raw weights in Dijkstra
-    edge_hint_val = w_uv - h_src + h_dst
+    edge_hint_val = (w_uv - h_src + h_dst) * scale_factor
 
-    # --- 5. NODE SCALAR COMPUTATION ---
-    # Use f(n) = g(n) + h(n) directly - all values are non-negative!
-    # The relaxation math still works: f(s) + w'(s,r) < f(r) ⟺ g(s) + w < g(r)
-    # Start has f(start) = 0 + h(start) = h(start), not 0, but that's fine.
-    EPS = 1e-4  # Small epsilon for tie-breaking
+    # --- 6. NODE SCALAR COMPUTATION ---
+    # For A* → Dijkstra reduction: d'(n) = f(n) - h(start) = g(n) + h(n) - h(start)
+    # BUT: undiscovered nodes get random values (like Dijkstra), not h(n) - h(start)
+    EPS = 1e-4  # Tie-breaking
 
     def compute_current_scalars(g_curr, disc_mask):
         s = np.copy(edge_hint_val)
@@ -494,12 +504,12 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
         if mask_loops.sum() != n:
              raise ValueError(f"Graph Error: Found {mask_loops.sum()} self-loops, expected {n}")
 
-        # For DISCOVERED nodes: f(n) = g + h (always non-negative!)
-        # EPS*g breaks ties in favor of higher g (closer to goal)
-        f_vals = g_curr + h_vals - EPS * g_curr
+        # For DISCOVERED nodes: d'(n) = g(n) + h(n) - h(start) - EPS*g(n)
+        # For UNDISCOVERED nodes: use random init (like Dijkstra)
+        d_prime_discovered = (g_curr + h_vals - h_start - EPS * g_curr) * scale_factor
         
-        # Blend: discovered nodes get f-values, undiscovered get random
-        node_scalars = np.where(disc_mask, f_vals, init_random)
+        # Blend: discovered nodes get proper d', undiscovered get random
+        node_scalars = np.where(disc_mask, d_prime_discovered, init_random)
         
         s[mask_loops] = node_scalars[instance.edge_index[0][mask_loops]]
         return s
@@ -518,8 +528,9 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     )
 
     for _ in range(n):
-        # --- 6. SELECTION LOGIC WITH TIE-BREAKING ---
+        # --- 7. SELECTION LOGIC WITH TIE-BREAKING ---
         # Selection based on f = g + h, with tie-breaking via EPS
+        # We compute: f - EPS*g = g + h - EPS*g = (1-EPS)*g + h
         f_for_selection = g_score + h_vals
         current_ranks = f_for_selection - (EPS * g_score)
         
@@ -829,7 +840,7 @@ class ErdosRenyiGraphSampler:
 
 class GeometricGraphSampler:
     """
-    Generates Random Geometric Graphs (RGG).
+    Generates Random Geometric Graphs (RGG) with 3NN connectivity.
     Nodes are placed randomly in 2D space [0,1]^2.
     Edges are created between nodes closer than a radius 'r'.
     Edge weights are the Euclidean distance.
@@ -1052,7 +1063,7 @@ ALGORITHMS = {
     "bfs": bfs, #==breadth first search
     "dfs": dfs, #==depth first search
     "mst": mst, #==PRIM as that is the algorithm used
-    "dijkstra": dijkstra, #==SP as that is the algorithm used
+    "dijkstra": dijkstra, #==SP as that is the algorithm usedf
     "mis": mis, #==maximum independent set
     "a_star": a_star, #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges? no relaxation already possible
     "eccentricity": eccentricity, #==eccentricity of source node (max shorttest distance to reach any other node)
@@ -1109,7 +1120,7 @@ def _worker_logic_chunk(args):
                 if config.algorithm == 'a_star':
                     node_fts, edge_fts, scalars = algorithm(
                         instance, 
-                        build_full_tree=True, 
+                        build_full_tree=getattr(config, "full_tree", True), 
                         pad_len=config.problem_size[split]
                     )
                 else:
@@ -1337,7 +1348,7 @@ def _lazy_generate_sample(args):
 
     # 2. Run algorithm (NumPy outputs)
     if algorithm_name == 'a_star':
-        node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=True, pad_len=problem_size)
+        node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=getattr(config, "full_tree", True), pad_len=problem_size)
     else:
         node_fts, edge_fts, scalars = algorithm(instance)
 
@@ -1414,7 +1425,7 @@ class LazyDataset(Dataset):
             # Fallback to spawn if needed, but fork is faster for read-only config sharing
             #DEBUG: try spawn for now
             try:
-                ctx = mp_module.get_context('spawn')
+                ctx = mp_module.get_context('fork')
                 self.executor = ProcessPoolExecutor(max_workers=self.num_prefetch_workers, mp_context=ctx)
             except ValueError:
                 self.executor = ProcessPoolExecutor(max_workers=self.num_prefetch_workers)
@@ -1535,9 +1546,9 @@ class LazyDataset(Dataset):
                 should_yield = False
                 if max_batch_size and len(batch) >= max_batch_size:
                     should_yield = True
-                elif self.problem_size >= 600 and len(batch) >= 1:
-                    # For very large graphs, yield after EVERY sample to avoid OOM
-                    should_yield = True
+                # elif self.problem_size >= 600 and len(batch) >= 1:
+                #     # For very large graphs, yield after EVERY sample to avoid OOM
+                #     should_yield = True
                 
                 if should_yield:
                     yield pad_and_collate(batch)
@@ -2104,7 +2115,7 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
 
         if config.algorithm == 'a_star':
             # A* needs pos for heuristic
-            node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=True, pad_len = config.problem_size[split])
+            node_fts, edge_fts, scalars = algorithm(instance, build_full_tree=getattr(config, "full_tree", True), pad_len = config.problem_size[split])
         else:
             node_fts, edge_fts, scalars = algorithm(instance)
 
