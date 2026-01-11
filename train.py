@@ -1208,6 +1208,8 @@ if __name__ == "__main__":
                              "2) Comma-separated paths to multiple config files")
     parser.add_argument("--num_seeds", type=int, default=1, help="Number of random seeds to train, If set on restart this many seeds will be checked for incomplete jobs.")
     parser.add_argument("--seed_start", type=int, default=42, help="Starting seed value (default: 42)")
+    parser.add_argument("--lr", "--learning_rate", type=float, default=None,
+                        help="Override learning rate from config")
     parser.add_argument("--multitask", action="store_true",
                         help="Enable multitask training")
     parser.add_argument("--parallel", action="store_true",
@@ -1393,6 +1395,8 @@ if __name__ == "__main__":
                 model = train_multitask(configs, job['seed'], session=session, gpu_id=int(options.gpus) if options.gpus else None)
             else:
                 config = base_config.read_config(job['config_path'])
+                if args.lr is not None:
+                    config.learning_rate = args.lr
                 model = train(config, job['seed'], session=session, gpu_id=int(options.gpus) if options.gpus else None)
             
             exit()
@@ -1466,4 +1470,6 @@ if __name__ == "__main__":
             else:
                 print("Train with config {}".format(options.config_path))
                 config = base_config.read_config(options.config_path)
+                if options.lr is not None:
+                    config.learning_rate = options.lr
                 model = train(config, seed, session=session, gpu_id=int(options.gpus) if options.gpus else None)

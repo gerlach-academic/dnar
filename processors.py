@@ -25,28 +25,33 @@ class SelectBest(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         h = config.h
+        self.use_select_best = config.use_select_best
         self.emb = torch.nn.Embedding(2 ** (config.num_node_states + 1), config.h)
 
     def forward(self, binary_states, scalars, index):
         states = 2 * from_binary_states(binary_states)
-        group_with_reciever = torch.cat( #just a stacking of the states & (batch/edge) index
-            [torch.unsqueeze(states, -1), torch.unsqueeze(index, -1)], dim=1
-        ) # shape [n_nodes, n_indexes(=2)], each combination is a group
-        _, group_index = torch.unique( #finds the unique groups based on the combined state, throws away the batch index, returns the unique group index per node
-            group_with_reciever, sorted=False, return_inverse=True, dim=0
-        )
+        if self.use_select_best:
+            
+            group_with_reciever = torch.cat( #just a stacking of the states & (batch/edge) index
+                [torch.unsqueeze(states, -1), torch.unsqueeze(index, -1)], dim=1
+            ) # shape [n_nodes, n_indexes(=2)], each combination is a group
+            _, group_index = torch.unique( #finds the unique groups based on the combined state, throws away the batch index, returns the unique group index per node
+                group_with_reciever, sorted=False, return_inverse=True, dim=0
+            )
 
-        #1 for best value inside the group, 0 else
-        best_in_group = gumbel_softmax( #dunno why it uses gumbel softmax here, not just argmax    
-            -scalars.squeeze(), #chooses the minimum scalar
-            group_index, 
-            tau=0.0, 
-            use_noise=False
-        )
+            #1 for best value inside the group, 0 else
+            best_in_group = gumbel_softmax( #dunno why it uses gumbel softmax here, not just argmax    
+                -scalars.squeeze(), #chooses the minimum scalar
+                group_index, 
+                tau=0.0, 
+                use_noise=False
+            )
 
-        state_with_best = states + best_in_group
-        return self.emb(state_with_best.long())
+            state_with_best = states + best_in_group
+            return self.emb(state_with_best.long())
 
+        else:
+            return self.emb(states.long())
 
 class AttentionModule(torch.nn.Module):
     def __init__(self, config: base_config.Config):
@@ -66,6 +71,7 @@ class AttentionModule(torch.nn.Module):
         self.select_best_virtual = SelectBest(config)
         self.select_best_by_reciever = SelectBest(config)
 
+        self.use_static_fts = config.use_static_fts
         self.static_fts_encoder = StatesEncoder(h, 2)
         self.combine_fts = Linear(3 * h, h, bias=False)
 
@@ -124,7 +130,10 @@ class AttentionModule(torch.nn.Module):
         rlx = scalars < reciever_s
         rlx_d = sender_s + scalars < reciever_s
 
-        fts = torch.cat([rlx, rlx_d], dim=-1).long()
+        fts = torch.cat([
+            rlx if self.use_static_fts[0] else torch.zeros_like(rlx), 
+            rlx_d if self.use_static_fts[1] else torch.zeros_like(rlx_d)
+        ], dim=-1).long()
         return self.static_fts_encoder(fts)
 
     def select_best_from_virtual(self, node_states, scalars, batch):

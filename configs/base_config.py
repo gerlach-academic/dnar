@@ -43,7 +43,9 @@ class Config:
 
     output_type: str = 'pointer'
     output_idx: int = 0
-    
+
+    use_static_fts: List[bool] = (True, True)  #whether to use static features for (rlx, rlx_d)
+    use_select_best: bool = True  #whether to use select best mechanism
     # --- multitask ---
     # Number of algorithms for multitask learning. Set > 1 to enable.
     # When enabled, the model creates separate encoder/decoder components
