@@ -652,13 +652,11 @@ def eccentricity(instance: ProblemInstance):
         return pointers
     
     def compute_current_scalars():
-        # Align with CLRS hints: floodstate_h and echostate_h
-        # We combine them into the single scalar channel via max to provide local supervision
+        # Self-loops get the current eccentricity estimate (echo_state at source)
         s = np.zeros(len(instance.edge_index[0]), dtype=np.float32)
-        node_vals = np.maximum(flood_state, echo_state)
         for i, (src, dst) in enumerate(zip(instance.edge_index[0], instance.edge_index[1])):
             if src == dst:
-                s[i] = node_vals[src]
+                s[i] = echo_state[source]
         return s
     
     def send_flood_msg(node, msg, messages, next_tree):
@@ -1162,7 +1160,6 @@ def _worker_logic_chunk(args):
                     'edge_index': edge_index,
                     'pos': instance.pos,
                     'goal': instance.goal,
-                    'start': instance.start,
                     'output_type': config.output_type,
                     'output_idx': config.output_idx,
                     't_node': target_node_states,
@@ -1192,7 +1189,7 @@ def create_dataloader_distributed(config, split: str, seed: int, num_workers: in
     target_node_states = max(config.num_node_states, MAX_NODE_STATES)
     target_edge_states = max(config.num_edge_states, MAX_EDGE_STATES)
     config_dict = vars(config) if hasattr(config, '__dict__') else config.__dict__
-    num_workers=1
+    
     if num_workers>1:
         # Adaptive chunk sizing based on graph size to limit memory per worker
         # Each sample at size n uses ~(n * n * n * 4 * 2 / 1e9) GB for edge_fts before optimization
@@ -1281,13 +1278,8 @@ def _process_worker_result(result):
     scalars_t = torch.tensor(result['scalars'], dtype=torch.float32)
     edge_index_t = torch.tensor(result['edge_index'], dtype=torch.long).contiguous()
     
-    # For scalar output type, y is the final scalar on self-loops
-    if result['output_type'] == "scalar":
-        self_loop_mask = edge_index_t[0] == edge_index_t[1]
-        y = scalars_t[self_loop_mask, -1, 0].clone().detach()  # Final timestep scalars on self-loops
-    else:
-        output_fts = edge_t if result['output_type'] == "pointer" else node_t
-        y = output_fts[:, -1, result['output_idx']].clone().detach().long()
+    output_fts = edge_t if result['output_type'] == "pointer" else node_t
+    y = output_fts[:, -1, result['output_idx']].clone().detach().long()
     
     return Data(
         node_fts=node_t,
@@ -1296,8 +1288,7 @@ def _process_worker_result(result):
         edge_index=edge_index_t,
         y=y,
         pos=torch.tensor(result['pos'], dtype=torch.float),
-        goal=torch.tensor(result['goal'], dtype=torch.long),
-        start=torch.tensor(result['start'], dtype=torch.long)
+        goal=torch.tensor(result['goal'], dtype=torch.long)
     )
 
 def create_dataloader(config: base_config.Config, split: str, seed: int, device, num_workers: int = None):
@@ -1392,14 +1383,8 @@ def _lazy_generate_sample(args):
     node_fts = _pad_features(torch.from_numpy(node_fts), num_node_states).numpy()
     edge_fts = _pad_features(torch.from_numpy(edge_fts), num_edge_states).numpy()
 
-    # Compute y based on output type
-    if output_type == "scalar":
-        # For scalar output, y is the final scalar on self-loops
-        self_loop_mask = edge_index[0] == edge_index[1]
-        y = scalars[self_loop_mask, -1, 0]  # (N,) - one value per node
-    else:
-        output_fts = edge_fts if output_type == "pointer" else node_fts
-        y = output_fts[:, -1, output_idx]
+    output_fts = edge_fts if output_type == "pointer" else node_fts
+    y = output_fts[:, -1, output_idx]
 
     print(f"    [Worker {idx}] Completed generation")
     return {
@@ -1410,7 +1395,6 @@ def _lazy_generate_sample(args):
         "y": y,
         "pos": instance.pos,
         "goal": instance.goal,
-        "start": instance.start,
         "sample_idx": idx # Return the index for tracking!
     }
 
@@ -1510,24 +1494,14 @@ class LazyDataset(Dataset):
             if goal_tensor.dim() == 0:
                 goal_tensor = goal_tensor.unsqueeze(0)
         
-        # Handle start node similarly
-        start_val = c.get("start", 0)
-        if isinstance(start_val, (int, float)):
-            start_tensor = torch.tensor(start_val, dtype=torch.long)
-        else:
-            start_tensor = torch.tensor(start_val, dtype=torch.long)
-            if start_tensor.dim() == 0:
-                start_tensor = start_tensor.unsqueeze(0)
-        
         return Data(
             node_fts=torch.tensor(c["node_fts"], dtype=torch.float32),
             edge_fts=torch.tensor(c["edge_fts"], dtype=torch.float32),
             scalars=torch.tensor(c["scalars"], dtype=torch.float32),
             edge_index=torch.tensor(c["edge_index"], dtype=torch.long),
-            y=torch.tensor(c["y"], dtype=torch.long if c["y"].dtype != np.float32 else torch.float32),
+            y=torch.tensor(c["y"], dtype=torch.long),
             pos=torch.tensor(c["pos"], dtype=torch.float32),
             goal=goal_tensor,
-            start=start_tensor,
         )
     
     def iter_batches_as_ready(self, max_batch_size=None, min_batch_size=1):
@@ -1635,7 +1609,6 @@ class LazyDataset(Dataset):
                         'y': item.y.numpy() if hasattr(item.y, 'numpy') else item.y,
                         'pos': item.pos.numpy() if hasattr(item.pos, 'numpy') else item.pos,
                         'goal': int(item.goal.item()) if item.goal.dim() == 0 else int(item.goal[0].item()),
-                        'start': int(item.start.item()) if item.start.dim() == 0 else int(item.start[0].item()),
                     }
                     self.buffer.append(self._to_data(item_dict))
         
@@ -2109,7 +2082,6 @@ def pad_and_collate(batch):
             y=padded_ys[i], 
             pos=batch[i].pos,
             goal=batch[i].goal,
-            start=batch[i].start,
             num_nodes=max_N, 
         )
         for i in range(B)
@@ -2179,13 +2151,8 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
         node_fts = _pad_features(node_fts, target_node_states)
         edge_fts = _pad_features(edge_fts, target_edge_states)
 
-        # For scalar output type, y is the final scalar on self-loops
-        if config.output_type == "scalar":
-            self_loop_mask = edge_index[0] == edge_index[1]
-            y = scalars[self_loop_mask, -1, 0].clone().detach()
-        else:
-            output_fts = edge_fts if config.output_type == "pointer" else node_fts
-            y = output_fts[:, -1, config.output_idx].clone().detach()
+        output_fts = edge_fts if config.output_type == "pointer" else node_fts
+        y = output_fts[:, -1, config.output_idx].clone().detach()
 
         datapoints.append(
             Data(
@@ -2195,8 +2162,7 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
                 edge_index=edge_index,
                 y=y,
                 pos=torch.tensor(instance.pos, dtype=torch.float),
-                goal=torch.tensor(instance.goal),
-                start=torch.tensor(instance.start, dtype=torch.long)
+                goal=torch.tensor(instance.goal)
             )
         )
     

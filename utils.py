@@ -102,73 +102,6 @@ def node_mask_accuracy(graph, prediction):
 def node_mask_accuracy_graph_level(graph, prediction):
     return 1.0 * (node_mask_accuracy(graph, prediction) == 1.0)
 
-
-# =============================================================================
-# SCALAR OUTPUT METRICS (for eccentricity, etc.)
-# =============================================================================
-
-def scalar_mse_per_node(graph, prediction):
-    """
-    MSE between predicted and ground truth scalars, averaged over all nodes.
-    
-    Args:
-        graph: PyG graph with y containing ground truth scalars (one per node)
-        prediction: Predicted scalar values (one per node)
-    
-    Returns:
-        Mean squared error across all nodes
-    """
-    return ((prediction - graph.y.float()) ** 2).mean()
-
-
-def scalar_mse_source(graph, prediction):
-    """
-    MSE at the source node only.
-    
-    Args:
-        graph: PyG graph with y and start attributes
-        prediction: Predicted scalar values (one per node)
-    
-    Returns:
-        Squared error at the source node
-    """
-    source_idx = graph.start.item() if hasattr(graph.start, 'item') else graph.start
-    return ((prediction[source_idx] - graph.y[source_idx].float()) ** 2)
-
-
-def scalar_integer_accuracy_per_node(graph, prediction):
-    """
-    Accuracy of rounded integer predictions, averaged over all nodes.
-    
-    Args:
-        graph: PyG graph with y containing ground truth scalars
-        prediction: Predicted scalar values (one per node)
-    
-    Returns:
-        Fraction of nodes where rounded prediction equals ground truth
-    """
-    pred_rounded = torch.round(prediction)
-    gt_rounded = torch.round(graph.y.float())
-    return (pred_rounded == gt_rounded).float().mean()
-
-
-def scalar_integer_accuracy_source(graph, prediction):
-    """
-    Accuracy of rounded integer prediction at the source node only.
-    
-    Args:
-        graph: PyG graph with y and start attributes
-        prediction: Predicted scalar values (one per node)
-    
-    Returns:
-        1.0 if rounded prediction equals ground truth at source, else 0.0
-    """
-    source_idx = graph.start.item() if hasattr(graph.start, 'item') else graph.start
-    pred_rounded = torch.round(prediction[source_idx])
-    gt_rounded = torch.round(graph.y[source_idx].float())
-    return 1.0 * (pred_rounded == gt_rounded)
-
-
 def score(data, batched_prediction, calculators, output_type) -> Dict[str, float]:
     """
     Scores a batch of graphs using provided calculators.
@@ -176,20 +109,17 @@ def score(data, batched_prediction, calculators, output_type) -> Dict[str, float
         data: PyG batch with multiple graphs
         batched_prediction: Model predictions for the batch
         calculators: Tuple of metric functions
-        output_type: 'pointer', 'node_mask', or 'scalar'
+        output_type: 'pointer' or 'node_mask'
     Returns:
         Dictionary of metric scores
     """
     scores = defaultdict(float)
     for batch_idx, graph in enumerate(data.to_data_list()):
-        # Determine prediction indexing based on output type
-        if output_type == "pointer":
-            batch_pred_idx = data.batch[data.edge_index[0]]
-        elif output_type == "scalar":
-            # For scalar output, predictions are per-node (on self-loops)
-            batch_pred_idx = data.batch
-        else:  # node_mask
-            batch_pred_idx = data.batch
+        batch_pred_idx = (
+            data.batch[data.edge_index[0]]
+            if output_type == "pointer"
+            else data.batch
+        )
         prediction = batched_prediction[batch_pred_idx == batch_idx]
 
         for calculator in calculators:
@@ -696,17 +626,7 @@ class ModelSaver:
 
 NODE_POINTER_METRICS = (pointer_accuracy, pointer_accuracy_graph_level)
 NODE_MASK_METRICS = (node_mask_accuracy, node_mask_accuracy_graph_level)
-NODE_SCALAR_METRICS = (
-    scalar_mse_per_node, 
-    scalar_mse_source,
-    scalar_integer_accuracy_per_node, 
-    scalar_integer_accuracy_source
-)
-METRICS = {
-    "pointer": NODE_POINTER_METRICS, 
-    "node_mask": NODE_MASK_METRICS,
-    "scalar": NODE_SCALAR_METRICS
-}
+METRICS = {"pointer": NODE_POINTER_METRICS, "node_mask": NODE_MASK_METRICS}
 
 
 # =============================================================================

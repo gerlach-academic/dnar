@@ -367,13 +367,8 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
 
                 #early stopping check
                 if session:
-                    # Determine metric name based on output type
-                    if config.output_type == "pointer":
-                        metric_name = "pointer_accuracy_graph_level"
-                    elif config.output_type == "scalar":
-                        metric_name = "scalar_integer_accuracy_source"  # Primary scalar metric
-                    else:  # node_mask
-                        metric_name = "node_mask_accuracy_graph_level"
+                    # Determine metric name
+                    metric_name = "pointer_accuracy_graph_level" if config.output_type == "pointer" else "node_mask_accuracy_graph_level"
                     current_score = val_scores.get(metric_name, 0.0)
 
                     if (steps >= config.min_iterations and current_score==1.0) and session.check_early_stopping(current_score):
@@ -900,12 +895,7 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         # Only check if we actually evaluated this round (look for keys in buffer)
         if session and any("Val/" in k for k in round_metrics_buffer):
             # Determine metric name based on output type
-            if unified_config.output_type == "pointer":
-                metric_name = "pointer_accuracy_graph_level"
-            elif unified_config.output_type == "scalar":
-                metric_name = "scalar_integer_accuracy_source"
-            else:  # node_mask
-                metric_name = "node_mask_accuracy_graph_level"
+            metric_name = "pointer_accuracy_graph_level" if unified_config.output_type == "pointer" else "node_mask_accuracy_graph_level"
             
             # Extract scores for this specific metric across all algorithms
             # Key format: "Val/{algorithm}/{metric_name}"
