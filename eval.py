@@ -205,6 +205,7 @@ if __name__ == "__main__":
     parser.add_argument('--no-aggregate', action='store_true')
     parser.add_argument('--timeout', type=int, default=0, help='Max Runtime in Minutes')
     parser.add_argument('--gpu', type=int, default=-1, help='GPU ID to use (-1 for auto)')
+    parser.add_argument('--old', action='store_true', help='Use old checkpoint path format')
     num_eval_workers = 1 #num of gpus for eval, if set to 1 we use gpu==3
     args = parser.parse_args()
 
@@ -333,7 +334,11 @@ if __name__ == "__main__":
 
         # Checkpoint path
         user = os.getenv("USER") or "default_user"
-        checkpoint_path = Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{args.size}_{args.seed}.pkl") if config.graph_type == "er" else Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{config.graph_type}_{args.size}_{args.seed}.pkl")
+        if args.old:
+            checkpoint_path = Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{args.size}_{args.seed}.pkl")
+        else:
+            checkpoint_path = Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{args.size}_{args.seed}.pkl") if config.graph_type == "er" else Path(f"/hpcwork/{user}/eval/eval_checkpoint_{algorithm}_{config.graph_type}_{args.size}_{args.seed}.pkl")
+        print(f">> Checkpoint path: {checkpoint_path}")
         results = []
         
         # Load checkpoint if exists
@@ -346,10 +351,13 @@ if __name__ == "__main__":
                 results = ckpt['results']
                 start_seed_idx = ckpt['next_seed_idx']
                 partial_state = ckpt.get('partial_state')
-                if partial_state:
+                if partial_state and partial_state.get('processed_count', 0) < config.num_samples[split]:
                      print(f">> Resuming SECONDS (partial) seed {start_seed_idx} at sample {partial_state['processed_count']}")
                 else:
                      print(f">> Resuming from checkpoint: {len(results)} seeds done, starting at seed index {start_seed_idx}")
+
+                if len(results) > 3:
+                    results = results[-3:]  # Keep last 3 for quick inspection
             except Exception as e:
                 print(f">> Checkpoint load failed: {e}. Starting fresh.")
 
@@ -447,7 +455,7 @@ if __name__ == "__main__":
             
             # Create lazy dataset with prefetching - use iter_as_ready() for maximum throughput
             # cpu_count = 0 #debug , 
-            cpu_count = 0 if algorithm in ('dfs', 'a_star') or args.size >=800 else os.cpu_count()//4 
+            cpu_count = 0 if algorithm in ('dfs', 'a_star') or args.size >800 else os.cpu_count()//4 
             from generate_data import LazyDataset, ALGORITHMS, ErdosRenyiGraphSampler, GridGraphSampler, RoadmapGraphSampler, GeometricGraphSampler
             import numpy as np
             np.random.seed(seed)

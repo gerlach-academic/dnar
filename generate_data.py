@@ -477,37 +477,22 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
         scale_factor = 1.0 / math.sqrt(n)
 
     # --- 3. Heuristics ---
-    # For geometric graphs with Euclidean edge weights: Euclidean distance is optimal.
-    # For grid graphs with 4-connectivity (unit cost): Manhattan distance is optimal.
-    # For grid graphs with 8-connectivity: Chebyshev or Octile distance.
-    # Current: Euclidean for 2D, L1 for 1D (matches GeometricGraphSampler edge weights)
     if instance.pos.ndim == 2:
         h_vals = np.linalg.norm(instance.pos - instance.pos[instance.goal], axis=1)
     else:
         h_vals = np.abs(instance.pos - instance.pos[instance.goal])
     
-    h_start = h_vals[instance.start]  # Constant offset for reduction
+    h_start = h_vals[instance.start]
 
     # --- 4. Initialization ---
-    # CRITICAL: For true Dijkstra equivalence, undiscovered nodes need random scalars
-    # just like Dijkstra uses instance.pos for unvisited nodes.
-    # 
-    # We track:
-    # - g_score: actual g-values (0 for undiscovered, updated when discovered)
-    # - discovered: mask of which nodes have been reached
-    # - init_random: random values for undiscovered nodes (like Dijkstra's instance.pos)
-    
     g_score = np.zeros(n, dtype=np.float32)
     discovered = np.zeros(n, dtype=bool)
     
-    # Random initialization for undiscovered nodes - EXACTLY like Dijkstra
-    # Generate fresh sorted random values (like ER graphs do) for consistency
+    # Random initialization for undiscovered nodes
     random_pos = np.random.uniform(0.0, 1.0, (n,))
     init_random = random_pos[np.argsort(random_pos)].astype(np.float32)
     
     # --- 4. HINT PHYSICS SETUP ---
-    # Edge Hint: Potential Function w' = w - h(u) + h(v)
-    # This is the key A* → Dijkstra reduction. NO SCALING to match Dijkstra.
     h_src = h_vals[instance.edge_index[0]]
     h_dst = h_vals[instance.edge_index[1]]
     w_uv = instance.adj[instance.edge_index[0], instance.edge_index[1]]
@@ -515,10 +500,6 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     edge_hint_val = (w_uv - h_src + h_dst) * scale_factor
 
     # --- 6. NODE SCALAR COMPUTATION ---
-    # For A* → Dijkstra reduction: d'(n) = f(n) - h(start) = g(n) + h(n) - h(start)
-    # BUT: undiscovered nodes get random values (like Dijkstra), not h(n) - h(start)
-    EPS = 1e-4  # Tie-breaking
-
     def compute_current_scalars(g_curr, disc_mask):
         s = np.copy(edge_hint_val)
         mask_loops = instance.edge_index[0] == instance.edge_index[1]
@@ -526,9 +507,9 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
         if mask_loops.sum() != n:
              raise ValueError(f"Graph Error: Found {mask_loops.sum()} self-loops, expected {n}")
 
-        # For DISCOVERED nodes: d'(n) = g(n) + h(n) - h(start) - EPS*g(n)
+        # For DISCOVERED nodes: d'(n) = g(n) + h(n) - h(start)
         # For UNDISCOVERED nodes: use random init (like Dijkstra)
-        d_prime_discovered = (g_curr + h_vals - h_start - EPS * g_curr) * scale_factor
+        d_prime_discovered = (g_curr + h_vals - h_start) * scale_factor
         
         # Blend: discovered nodes get proper d', undiscovered get random
         node_scalars = np.where(disc_mask, d_prime_discovered, init_random)
@@ -536,7 +517,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
         s[mask_loops] = node_scalars[instance.edge_index[0][mask_loops]]
         return s
 
-    # Setup Start Node: discovered with g(start) = 0
+    # Setup Start Node
     g_score[instance.start] = 0
     discovered[instance.start] = True
     in_open[instance.start] = 1
@@ -550,18 +531,24 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
     )
 
     for _ in range(n):
-        # --- 7. SELECTION LOGIC WITH TIE-BREAKING ---
-        # Selection based on f = g + h, with tie-breaking via EPS
-        # We compute: f - EPS*g = g + h - EPS*g = (1-EPS)*g + h
-        f_for_selection = g_score + h_vals
-        current_ranks = f_for_selection - (EPS * g_score)
+        # --- 7. SELECTION LOGIC: f-score primary, node index secondary ---
+        f_scores = g_score + h_vals
         
-        candidates = current_ranks + (1.0 - in_open) * 1e9 
+        # Create selection key: (f_score, node_index)
+        # Nodes not in open set get infinite f-score
+        open_mask = in_open == 1
         
-        if np.min(candidates) >= 1e9: 
-            break 
+        if not np.any(open_mask):
+            break
         
-        current = np.argmin(candidates)
+        # Among open nodes, find minimum f-score
+        f_open = np.where(open_mask, f_scores, np.inf)
+        min_f = np.min(f_open)
+        
+        # Among nodes with minimum f-score, pick lowest index
+        # This is the key change: deterministic tie-breaking by index
+        candidates = np.where((f_open == min_f) & open_mask)[0]
+        current = candidates[0]  # Lowest index among tied nodes
         
         # --- 8. TOGGLE LOGIC ---
         if not build_full_tree and current == instance.goal:
@@ -587,7 +574,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
                 pointers[neighbor] = np.zeros(n, dtype=np.int32)
                 pointers[neighbor][current] = 1
                 g_score[neighbor] = tentative_g
-                discovered[neighbor] = True  # Mark as discovered
+                discovered[neighbor] = True
                 in_open[neighbor] = 1
         
         push_states(
@@ -597,8 +584,7 @@ def a_star(instance: ProblemInstance, build_full_tree: bool = True, pad_len:Opti
             edge_index=instance.edge_index,
         )
 
-    # if build_full_tree:
-    #fill the rest of the tree with the last state so the model basically stops updating on goal reached
+    # Pad to target length
     while len(node_states) < target_len:
         push_states(
             node_states, edge_states, scalars,
@@ -920,11 +906,15 @@ class GeometricGraphSampler:
         # 6. Extract final data
         final_adj = nx.to_numpy_array(G)
 
-        #add tiny bit of noise to break symmetries
-        if final_n > 1:
-            noise = np.random.uniform(1.0001, 1.001, size=final_adj.shape) #use additive noise, otherwise weights can become zero in the original
-            final_adj = final_adj * noise
-            final_adj = (final_adj + final_adj.T) / 2 # Ensure symmetry
+
+        #==========
+        # NOISE BREAKING: NO LONGER NEEDED, A_STAR NOW BREAKS TIES VIA NODE_INDICES
+        #==========
+        # #add tiny bit of noise to break symmetries
+        # if final_n > 1:
+        #     noise = np.random.uniform(1.0001, 1.001, size=final_adj.shape) #use additive noise, otherwise weights can become zero in the original
+        #     final_adj = final_adj * noise
+        #     final_adj = (final_adj + final_adj.T) / 2 # Ensure symmetry
         
         # We need to map the new indices back to the original positions
         # Since we just used convert_node_labels_to_integers on a subgraph,
@@ -986,11 +976,14 @@ class GridGraphSampler:
         adj = nx.to_numpy_array(G, weight=None) 
         adj[adj > 0] = scale 
 
-        #add tiny bit of noise to break symmetries
-        if N > 1:
-            noise = np.random.uniform(1.0001, 1.001, size=adj.shape)
-            adj = adj * noise
-            adj = (adj + adj.T) / 2 # Ensure symmetry
+        #==========
+        # NOISE BREAKING: NO LONGER NEEDED, A_STAR NOW BREAKS T
+        #==========
+        # #add tiny bit of noise to break symmetries
+        # if N > 1:
+        #     noise = np.random.uniform(1.0001, 1.001, size=adj.shape)
+        #     adj = adj * noise
+        #     adj = (adj + adj.T) / 2 # Ensure symmetry
 
         start = np.random.randint(0, N)
         goal = np.random.randint(0, N)
@@ -1039,11 +1032,14 @@ class RoadmapGraphSampler:
              
         N = adj.shape[0]
 
+        #==========
+        # NOISE BREAKING: NO LONGER NEEDED, A_STAR NOW BREAKS T
+        #==========
         # Add tiny noise to break symmetries
-        if N > 1:
-            noise = np.random.uniform(1.00001, 1.001, size=adj.shape)
-            adj = adj * noise
-            adj = (adj + adj.T) / 2 # Ensure symmetry
+        # if N > 1:
+        #     noise = np.random.uniform(1.00001, 1.001, size=adj.shape)
+        #     adj = adj * noise
+        #     adj = (adj + adj.T) / 2 # Ensure symmetry
 
         start = np.random.randint(0, N)
         goal = np.random.randint(0, N)
