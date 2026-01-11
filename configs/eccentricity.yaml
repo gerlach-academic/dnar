@@ -16,3 +16,7 @@ edge_weights: true
 # --- model ---
 num_node_states: 2
 num_edge_states: 2
+
+# Eccentricity outputs scalar values (the eccentricity estimate)
+output_type: scalar
+output_idx: 0  # Index of scalar feature

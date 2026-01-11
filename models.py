@@ -75,7 +75,15 @@ class Dnar(Module):
             )
             loss += cur_step_loss / T
 
-        states = edge_states if self.output_type == "pointer" else node_states
-        output = states[:, self.output_idx]
+        # Return output based on output_type
+        if self.output_type == "scalar":
+            # For scalar tasks (e.g., eccentricity), return the predicted scalars
+            # Extract self-loop scalars as node-level predictions
+            self_loop_mask = batch.edge_index[0] == batch.edge_index[1]
+            output = cur_step_scalars[self_loop_mask].squeeze(-1)
+        elif self.output_type == "pointer":
+            output = edge_states[:, self.output_idx]
+        else:  # node_mask
+            output = node_states[:, self.output_idx]
 
         return output, loss
