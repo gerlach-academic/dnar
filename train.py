@@ -1186,6 +1186,7 @@ def train_worker(args):
     else:
         print(f"Train with config {config_path}")
         config = base_config.read_config(config_path)
+        config.learning_rate = options.lr if options.lr is not None else config.learning_rate
         model = train(config, seed, session=session, gpu_id=gpu_id)
     return {
         "seed": seed,
