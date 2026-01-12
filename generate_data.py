@@ -652,11 +652,12 @@ def eccentricity(instance: ProblemInstance):
         return pointers
     
     def compute_current_scalars():
-        # Self-loops get the current eccentricity estimate (echo_state at source)
+        # Align with CLRS hints: floodstate_h and echostate_h
+        # We combine them into the single scalar channel via max to provide local supervision
         s = np.zeros(len(instance.edge_index[0]), dtype=np.float32)
         for i, (src, dst) in enumerate(zip(instance.edge_index[0], instance.edge_index[1])):
             if src == dst:
-                s[i] = echo_state[source]
+                s[i] = echo_state[src]
         return s
     
     def send_flood_msg(node, msg, messages, next_tree):
@@ -771,6 +772,100 @@ def eccentricity(instance: ProblemInstance):
             edge_index=instance.edge_index,
         )
     
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
+
+def topological_sort(instance: ProblemInstance):
+    """
+    Kahn's Algorithm for Topological Sorting.
+    Relies on detecting when in-degree drops to 0. This is the canonical case
+    for needing 'aggregation' (counting) rather than just 'selection'.
+    
+    Node States:
+        - processed: 1 if node is added to sorted order
+        - ready: 1 if node has in-degree 0 and is in queue
+    
+    Scalars:
+        - Current in-degree of the node (normalized)
+    """
+    n = instance.adj.shape[0]
+    node_states = []
+    edge_states = []
+    scalars = []
+    
+    # 1. Compute In-Degrees
+    # We use adj > 0 to handle weighted graphs as simple connectivity
+    # Transpose adj because row=src, col=dst. Sum over rows for each col.
+    adj_bool = (instance.adj > 0).astype(np.int32)
+    in_degree = adj_bool.sum(axis=0)
+    
+    processed = np.zeros(n, dtype=np.int32)
+    ready = np.zeros(n, dtype=np.int32)
+    
+    # Edge states: just Pointers (no changing edge structure usually, but we can pointer to parents)
+    references = np.eye(n, dtype=np.int32) # Identity
+    self_loops = np.eye(n, dtype=np.int32)
+    
+    # Initialize queue with 0-degree nodes
+    queue_list = []
+    for i in range(n):
+        if in_degree[i] == 0:
+            ready[i] = 1
+            queue_list.append(i)
+    
+    def compute_current_scalars(cur_in_degrees):
+        # We pass the current in-degree as a scalar feature on self-loops
+        s = np.zeros(len(instance.edge_index[0]), dtype=np.float32)
+        # Normalize degree roughly so it's not huge
+        norm_deg = cur_in_degrees / max(1.0, n) 
+        
+        # Populate self-loops
+        for i, (src, dst) in enumerate(zip(instance.edge_index[0], instance.edge_index[1])):
+            if src == dst:
+                s[i] = norm_deg[src]
+        return s
+
+    # Initial State
+    push_states(
+        node_states, edge_states, scalars,
+        (processed, ready), (references, self_loops),
+        (compute_current_scalars(in_degree),),
+        edge_index=instance.edge_index
+    )
+    
+    # Process
+    while queue_list:
+        # Sort queue to ensure deterministic tie-breaking (lexicographical topo sort)
+        queue_list.sort() 
+        u = queue_list.pop(0) # Pop smallest index
+        
+        ready[u] = 0
+        processed[u] = 1
+        
+        # simulated "remove edges"
+        for v in instance.out_nodes[u]:
+            if processed[v]: continue
+            
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                ready[v] = 1
+                queue_list.append(v)
+        
+        push_states(
+            node_states, edge_states, scalars,
+            (processed, ready), (references, self_loops),
+            (compute_current_scalars(in_degree),),
+            edge_index=instance.edge_index
+        )
+        
+    # Pad
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (processed, ready), (references, self_loops),
+            (compute_current_scalars(in_degree),),
+            edge_index=instance.edge_index
+        )
+
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 def topological_sort(instance: ProblemInstance):
@@ -1298,7 +1393,7 @@ def _worker_logic_chunk(args):
                     'edge_index': edge_index,
                     'pos': instance.pos,
                     'goal': instance.goal,
-                    # 'start': instance.start,
+                    'start': instance.start,
                     'output_type': config.output_type,
                     'output_idx': config.output_idx,
                     't_node': target_node_states,
@@ -1424,6 +1519,13 @@ def _process_worker_result(result):
     else:
         output_fts = edge_t if result['output_type'] == "pointer" else node_t
         y = output_fts[:, -1, result['output_idx']].clone().detach().long()
+    # For scalar output type, y is the final scalar on self-loops
+    if result['output_type'] == "scalar":
+        self_loop_mask = edge_index_t[0] == edge_index_t[1]
+        y = scalars_t[self_loop_mask, -1, 0].clone().detach()  # Final timestep scalars on self-loops
+    else:
+        output_fts = edge_t if result['output_type'] == "pointer" else node_t
+        y = output_fts[:, -1, result['output_idx']].clone().detach().long()
     
     return Data(
         node_fts=node_t,
@@ -1433,7 +1535,7 @@ def _process_worker_result(result):
         y=y,
         pos=torch.tensor(result['pos'], dtype=torch.float),
         goal=torch.tensor(result['goal'], dtype=torch.long),
-        # start=torch.tensor(result['start'], dtype=torch.long)
+        start=torch.tensor(result['start'], dtype=torch.long)
     )
 
 def create_dataloader(config: base_config.Config, split: str, seed: int, device, num_workers: int = None):
@@ -1546,7 +1648,7 @@ def _lazy_generate_sample(args):
         "y": y,
         "pos": instance.pos,
         "goal": instance.goal,
-        # "start": instance.start,
+        "start": instance.start,
         "sample_idx": idx # Return the index for tracking!
     }
 
@@ -1646,14 +1748,14 @@ class LazyDataset(Dataset):
             if goal_tensor.dim() == 0:
                 goal_tensor = goal_tensor.unsqueeze(0)
         
-        # # Handle start node similarly
-        # start_val = c.get("start", 0)
-        # if isinstance(start_val, (int, float)):
-        #     start_tensor = torch.tensor(start_val, dtype=torch.long)
-        # else:
-        #     start_tensor = torch.tensor(start_val, dtype=torch.long)
-        #     if start_tensor.dim() == 0:
-        #         start_tensor = start_tensor.unsqueeze(0)
+        # Handle start node similarly
+        start_val = c.get("start", 0)
+        if isinstance(start_val, (int, float)):
+            start_tensor = torch.tensor(start_val, dtype=torch.long)
+        else:
+            start_tensor = torch.tensor(start_val, dtype=torch.long)
+            if start_tensor.dim() == 0:
+                start_tensor = start_tensor.unsqueeze(0)
         
         return Data(
             node_fts=torch.tensor(c["node_fts"], dtype=torch.float32),
@@ -1663,7 +1765,6 @@ class LazyDataset(Dataset):
             y=torch.tensor(c["y"], dtype=torch.long if c["y"].dtype != np.float32 else torch.float32),
             pos=torch.tensor(c["pos"], dtype=torch.float32),
             goal=goal_tensor,
-            # start=start_tensor,
         )
     
     def iter_batches_as_ready(self, max_batch_size=None, min_batch_size=1):
@@ -1771,7 +1872,7 @@ class LazyDataset(Dataset):
                         'y': item.y.numpy() if hasattr(item.y, 'numpy') else item.y,
                         'pos': item.pos.numpy() if hasattr(item.pos, 'numpy') else item.pos,
                         'goal': int(item.goal.item()) if item.goal.dim() == 0 else int(item.goal[0].item()),
-                        # 'start': int(item.start.item()) if item.start.dim() == 0 else int(item.start[0].item()),
+                        'start': int(item.start.item()) if item.start.dim() == 0 else int(item.start[0].item()),
                     }
                     self.buffer.append(self._to_data(item_dict))
         
@@ -2245,7 +2346,7 @@ def pad_and_collate(batch):
             y=padded_ys[i], 
             pos=batch[i].pos,
             goal=batch[i].goal,
-            # start=batch[i].start,
+            start=batch[i].start,
             num_nodes=max_N, 
         )
         for i in range(B)
@@ -2332,7 +2433,7 @@ def create_dataloader_with_cache(config, split: str, seed: int, device):
                 y=y,
                 pos=torch.tensor(instance.pos, dtype=torch.float),
                 goal=torch.tensor(instance.goal),
-                # start=torch.tensor(instance.start, dtype=torch.long)
+                start=torch.tensor(instance.start, dtype=torch.long)
             )
         )
     
