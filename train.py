@@ -18,6 +18,8 @@ from configs import base_config
 from generate_data import create_dataloader, SPEC
 from utils import TrainingSession, RestartManager, get_temp_model_dir, finalize_model, get_least_used_gpus, get_gpus
 
+from grokfast import gradfilter_ma, gradfilter_ema
+
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -314,6 +316,7 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
     steps = resume_from_step
     training_interrupted = False
     early_stopped = False
+    grads = None
     while steps <= config.num_iterations:
         for batch in train_data:
             # Skip batches until we reach resume point (already at resume_from_step)
@@ -348,9 +351,15 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
                 writer.log_dict({f"Train/{k}": v/batch_length for k, v in batch_score.items()} | {"Train/loss": bacth_loss}, steps)
 
             assert not torch.isnan(loss)
-
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            if config.grokfast_ma:
+                gradfilter_ma(model, grads=grads, lamb=config.grokfast_lambda, window_size=config.grokfast_window_size)
+            elif config.grokfast_ema:
+                grads = gradfilter_ema(model, grads=grads, lamb=config.grokfast_lambda, alpha=config.grokfast_alpha)
+
             opt.step()
             opt.zero_grad()
 

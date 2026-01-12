@@ -1,0 +1,25 @@
+algorithm: mis
+
+learning_rate: 0.001
+grokfast_ema: true
+# --- data ---
+num_samples:
+  train: 10000
+  val: 320
+  test: 320
+
+problem_size:
+  train: 16
+  val: 16
+  test: 64
+
+generate_random_numbers: true
+
+# --- model ---
+num_node_states: 2
+num_edge_states: 1
+
+output_type: node_mask
+output_idx: 0
+
+wandb_project: dnar_grokking

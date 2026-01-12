@@ -23,6 +23,12 @@ class Config:
     processor_lower_t: float = 0.01 #gumbel annealing temperature end
     use_noise: bool = True #whether to use gumbel noise in the softmaxe
 
+    grokfast_ma:bool = False
+    grokfast_ema:bool = False
+    grokfast_window_size:int = 100
+    grokfast_alpha:float = 0.98
+    grokfast_lambda:float = 5.0
+
     # --- data ---
     num_samples: dict = None
     problem_size: dict = None
