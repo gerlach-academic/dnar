@@ -49,7 +49,7 @@ class Config:
 
     output_type: str = 'pointer'
     output_idx: int = 0
-
+    attention: str = 'hard'  #type of attention mechanism
     use_static_fts: List[bool] = (True, True)  #whether to use static features for (rlx, rlx_d)
     use_select_best: bool = True  #whether to use select best mechanism
     # --- multitask ---

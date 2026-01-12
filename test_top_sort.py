@@ -48,6 +48,19 @@ def test_generation():
     print(f"Edge Features Shape: {batch.edge_fts.shape}") # [B, T, E, F]
     print(f"Scalars Shape: {batch.scalars.shape}") # [B, T, E, 1]
     
+    # Check for start attribute
+    if hasattr(batch, 'start'):
+        print(f"Batch has 'start' attribute: {batch.start}")
+    else:
+        print("Batch MISSING 'start' attribute!")
+        
+    # Check individual graphs in batch
+    data_list = batch.to_data_list()
+    if data_list and hasattr(data_list[0], 'start'):
+        print(f"Individual Graph 0 has 'start': {data_list[0].start}")
+    else:
+        print("Individual Graph 0 MISSING 'start'!")
+    
     # Verify Adjacency is DAG (Upper Triangular roughly if sorted, but we permuted)
     # Actually just check we have data
     assert batch.node_fts.shape[0] == config.batch_size or batch.node_fts.shape[0] == 50, f"Batch size mismatch: {batch.node_fts.shape[0]}, expected {50}"

@@ -147,6 +147,80 @@ def bfs(instance: ProblemInstance):
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 
+def parallel_bfs(instance: ProblemInstance):
+    """
+    Parallel BFS: Expands the entire frontier simultaneously in each step.
+    
+    Key differences from sequential BFS:
+    - All nodes at distance d are discovered in ONE step
+    - Trace length = eccentricity from start (max distance to any node)
+    - When multiple parents can discover a node, we pick lowest-index parent
+    
+    This is the natural fit for Sum-aggregation attention:
+    A node joins the frontier if ANY neighbor is in the current layer.
+    """
+    n = instance.adj.shape[0]
+    node_states = []
+    edge_states = []
+    scalars = []
+
+    visited = np.zeros(n, dtype=np.int16)
+    pointers = np.eye(n, dtype=np.int16)
+    self_loops = np.eye(n, dtype=np.int16)
+
+    cur_scalars = get_scalar_pos_for_legacy(instance)[instance.edge_index[0]]
+
+    visited[instance.start] = 1
+
+    push_states(
+        node_states, edge_states, scalars,
+        (visited,), (pointers, self_loops), (cur_scalars,),
+        edge_index=instance.edge_index,
+    )
+
+    frontier = {instance.start}
+
+    while frontier:
+        # Collect ALL neighbors of ALL frontier nodes simultaneously
+        next_frontier = set()
+        # Track which parent discovered each node (for deterministic tie-breaking)
+        discovered_by = {}  # child -> parent (lowest index wins)
+        
+        for node in frontier:
+            for out in instance.out_nodes[node]:
+                if visited[out] == 0:
+                    next_frontier.add(out)
+                    # Tie-break: keep lowest-index parent
+                    if out not in discovered_by or node < discovered_by[out]:
+                        discovered_by[out] = node
+        
+        # Now apply all discoveries at once (parallel step)
+        for child, parent in discovered_by.items():
+            visited[child] = 1
+            pointers[child][child] = 0
+            pointers[child][parent] = 1
+        
+        frontier = next_frontier
+        
+        if frontier or len(node_states) == 1:  # Push if we discovered something or just started
+            push_states(
+                node_states, edge_states, scalars,
+                (visited,), (pointers, self_loops), (cur_scalars,),
+                edge_index=instance.edge_index,
+            )
+
+    # Pad to at least n states (for consistent tensor shapes)
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (visited,), (pointers, self_loops), (cur_scalars,),
+            edge_index=instance.edge_index,
+        )
+
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
+
+
+
 def dfs(instance: ProblemInstance):
     n = instance.adj.shape[0]
     node_states = []
@@ -307,6 +381,166 @@ def mst(instance: ProblemInstance):
             node_states, edge_states, scalars,
             (in_queue, in_tree), (pointers, self_loops),
             (compute_current_scalars(node_scalars),),
+            edge_index=instance.edge_index,
+        )
+
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
+
+def parallel_mst(instance: ProblemInstance):
+    """
+    Parallel MST (Borůvka's Algorithm).
+    
+    Mechanism:
+    1. Starts with n components.
+    2. In each step, EVERY component finds its minimum weight outgoing edge.
+    3. These edges are added to the MST simultaneously (Parallel Step).
+    4. Components are merged.
+    
+    States (Compatible with Standard MST):
+    - in_queue: 1 if node is not yet fully connected to the main tree (heuristic).
+    - in_tree: 1 if node has been processed/merged at least once.
+    - pointers: The MST edges found so far.
+    """
+    n = instance.adj.shape[0]
+    node_states = []
+    edge_states = []
+    scalars = []
+
+    # 1. State Initialization
+    # We maintain component IDs internally for logic, but output masks for the model
+    parent = list(range(n))
+    rank = [0] * n
+    
+    in_queue = np.ones(n, dtype=np.int32)
+    in_tree = np.zeros(n, dtype=np.int32)
+    pointers = np.eye(n, dtype=np.int32) # Self-loops initially
+    self_loops = np.eye(n, dtype=np.int32)
+
+    # Scalars: Edge weights on self-loops (Standard CLRS MST setup)
+    # Note: MST uses edge weights as hints.
+    # We populate the "current scalar" hint with weights.
+    edge_weights = instance.adj[instance.edge_index[0], instance.edge_index[1]]
+    
+    def compute_current_scalars():
+        # Just pass weights permanently
+        # CLRS MST usually puts node_key on self-loop, but Boruvka relies on edge weights.
+        # We put 0.0 on self-loops, weights on edges are static in adj.
+        # Actually, standard MST puts 'min_weight_to_tree' on self-loops.
+        # For Parallel, we can put 'current_min_outgoing_weight' on self-loops.
+        s = np.copy(edge_weights)
+        
+        # Populate self-loops with 0 (or some status)
+        mask_loops = instance.edge_index[0] == instance.edge_index[1]
+        s[mask_loops] = 0.0 
+        return s
+
+    # Union-Find Helpers
+    def find(i):
+        if parent[i] != i:
+            parent[i] = find(parent[i])
+        return parent[i]
+
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            if rank[root_i] < rank[root_j]:
+                parent[root_i] = root_j
+            elif rank[root_i] > rank[root_j]:
+                parent[root_j] = root_i
+            else:
+                parent[root_j] = root_i
+                rank[root_i] += 1
+            return True
+        return False
+
+    # Initial Push
+    push_states(
+        node_states, edge_states, scalars,
+        (in_queue, in_tree), (pointers, self_loops),
+        (compute_current_scalars(),),
+        edge_index=instance.edge_index,
+    )
+
+    num_components = n
+    
+    # Boruvka Loop
+    # Limit iterations to avoid infinite loops in disconnected graphs
+    max_steps = 2 * int(math.ceil(math.log2(n))) + 2
+    
+    for _ in range(max_steps):
+        if num_components <= 1:
+            break
+            
+        # 1. Find Minimum Outgoing Edge for each Component
+        # Store as: component_id -> (weight, u, v)
+        # We look for the cheapest edge (u, v) where u is in component
+        cheapest = {} 
+        
+        # Scan all edges (Naive scan is O(E), perfectly fine here)
+        rows, cols = np.nonzero(instance.adj)
+        weights = instance.adj[rows, cols]
+        
+        for u, v, w in zip(rows, cols, weights):
+            root_u = find(u)
+            root_v = find(v)
+            
+            if root_u != root_v:
+                # Update cheapest for component U
+                if root_u not in cheapest:
+                    cheapest[root_u] = (w, u, v)
+                else:
+                    # Tie-breaking: Weight first, then edge indices for determinism
+                    curr_w, curr_u, curr_v = cheapest[root_u]
+                    if w < curr_w or (w == curr_w and (u < curr_u or (u == curr_u and v < curr_v))):
+                        cheapest[root_u] = (w, u, v)
+                        
+                # We iterate symmetric edges, so V->U will be handled when loop reaches it
+        
+        # 2. Add Edges and Merge (Parallel Step)
+        if not cheapest:
+            break # Disconnected graph, done
+            
+        edges_to_add = []
+        for root_id in cheapest:
+            w, u, v = cheapest[root_id]
+            edges_to_add.append((u, v))
+            
+        # Apply changes
+        any_merge = False
+        for u, v in edges_to_add:
+            # Check if still disconnected (might have been merged by another edge in this batch)
+            if find(u) != find(v):
+                union(u, v)
+                num_components -= 1
+                any_merge = True
+                
+                # Update State
+                # In Boruvka, u points to v (the neighbor it found)
+                pointers[u] = np.zeros(n, dtype=np.int32)
+                pointers[u][v] = 1
+                
+                in_tree[u] = 1
+                in_queue[u] = 0
+                in_tree[v] = 1 # Neighbor is also touched
+        
+        # Push State after the parallel step
+        push_states(
+            node_states, edge_states, scalars,
+            (in_queue, in_tree), (pointers, self_loops),
+            (compute_current_scalars(),),
+            edge_index=instance.edge_index,
+        )
+        
+        if not any_merge:
+            break
+
+    # Final padding
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (in_queue, in_tree), (pointers, self_loops),
+            (compute_current_scalars(),),
             edge_index=instance.edge_index,
         )
 
@@ -962,6 +1196,90 @@ def topological_sort(instance: ProblemInstance):
 
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
+def parallel_topological_sort(instance: ProblemInstance):
+    """
+    Parallel Kahn's Algorithm.
+    Processes ALL ready nodes (in-degree 0) simultaneously in one step.
+    
+    This creates a dataset where the model must learn to:
+    1. Identify all currently valid nodes (Selection).
+    2. Decrement neighbor counts by the *number* of incoming active edges (Sum Aggregation).
+    """
+    n = instance.adj.shape[0]
+    node_states = []
+    edge_states = []
+    scalars = []
+    
+    # 1. Compute Initial In-Degrees
+    # adj is [src, dst], so sum over src (rows) for each dst (col)
+    adj_bool = (instance.adj > 0).astype(np.int32)
+    in_degree = adj_bool.sum(axis=0)
+    
+    processed = np.zeros(n, dtype=np.int32)
+    
+    # Identify initial layer
+    is_ready = (in_degree == 0).astype(np.int32)
+    
+    # Edge states: Identity (just placeholders for this task)
+    references = np.eye(n, dtype=np.int32)
+    self_loops = np.eye(n, dtype=np.int32)
+    
+    def compute_current_scalars(cur_in_degrees):
+        # Pass current in-degree as scalar on self-loops
+        s = np.zeros(len(instance.edge_index[0]), dtype=np.float32)
+        norm_deg = cur_in_degrees / max(1.0, n) 
+        
+        # Populate self-loops
+        # Optimized: masking is faster than zip iteration for large graphs
+        mask_loops = instance.edge_index[0] == instance.edge_index[1]
+        s[mask_loops] = norm_deg[instance.edge_index[0][mask_loops]]
+        return s
+
+    # Initial State Push
+    push_states(
+        node_states, edge_states, scalars,
+        (processed, is_ready), (references, self_loops),
+        (compute_current_scalars(in_degree),),
+        edge_index=instance.edge_index
+    )
+    
+    # Process layers until no nodes are ready
+    while np.any(is_ready):
+        # 1. Identify current layer indices
+        current_layer_nodes = np.where(is_ready == 1)[0]
+        
+        # 2. Mark them as processed immediately (Parallel Step)
+        processed[current_layer_nodes] = 1
+        is_ready[current_layer_nodes] = 0 # Remove from ready set
+        
+        # 3. Parallel Update of Neighbors (Simulated)
+        # For every node in the current layer, decrement its children's in-degree
+        for u in current_layer_nodes:
+            for v in instance.out_nodes[u]:
+                if not processed[v]:
+                    in_degree[v] -= 1
+        
+        # 4. Find new ready nodes (degree 0 and not yet processed)
+        new_ready_mask = (in_degree == 0) & (processed == 0)
+        is_ready = new_ready_mask.astype(np.int32)
+        
+        push_states(
+            node_states, edge_states, scalars,
+            (processed, is_ready), (references, self_loops),
+            (compute_current_scalars(in_degree),),
+            edge_index=instance.edge_index
+        )
+        
+    # Pad to n steps
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (processed, is_ready), (references, self_loops),
+            (compute_current_scalars(in_degree),),
+            edge_index=instance.edge_index
+        )
+
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
 
 # -----------------------------------------------------------------------------
 # 3. SAMPLERS
@@ -1034,19 +1352,34 @@ class ErdosRenyiGraphSampler:
             goal = (start + 1) % num_nodes # Dummy
             
             # Ensure DAG for Topological Sort
-            if self.algorithm == 'topological_sort':
-                # Remove back-edges relative to a random permutation to guarantee DAG
+            if self.algorithm in ['topological_sort', 'parallel_topological_sort']:
+                # Create a directed graph based on random permutation
+                # Only keep edge u->v if perm[u] < perm[v]
                 perm = np.random.permutation(num_nodes)
-                # Edge u->v allowed only if perm[u] < perm[v]
-                # This is standard way to generate Random DAGs
+                
+                # Mask out "backward" edges relative to permutation
+                # We iterate the existing symmetric edges
                 rows, cols = np.nonzero(adj)
                 for u, v in zip(rows, cols):
                     if perm[u] >= perm[v]:
-                        adj[u, v] = 0
-                        adj[v, u] = 0 # Undirected base, but here we treat adj as directed
+                        adj[u, v] = 0 
+                        # CRITICAL FIX: Do NOT set adj[v,u]=0 here. 
+                        # In a symmetric matrix, we will visit (v,u) later.
+                        # If we zero it now, we lose the edge entirely if perm[v] < perm[u]
                 
-                # Topological sort works on forests too, no need for connectivity check
-                return ProblemInstance(adj, start, goal, self.weighted, random_numbers, pos=pos)
+                # Since adj was symmetric, we just killed the 'u->v' where u>v (in perm rank).
+                # The 'v->u' (where v<u) remains.
+                # We might still have bidirectional zeros if we aren't careful?
+                # Actually, standard approach:
+                new_adj = np.zeros_like(adj)
+                rows, cols = np.nonzero(adj) # This has both u,v and v,u
+                for u, v in zip(rows, cols):
+                    if perm[u] < perm[v]:
+                        new_adj[u, v] = 1 # Keep weight if weighted? Assuming unweighted for ER TopSort
+                
+                adj = new_adj
+                
+                return ProblemInstance(adj, start, goal, self.weighted, None, pos=pos)
             
             n_components = connected_components(csr_matrix(adj), directed=False, return_labels=False)
             if n_components == 1:
@@ -1142,7 +1475,7 @@ class GeometricGraphSampler:
             random_numbers = np.random.rand(final_n, final_n)
 
         # Enforce DAG for Topological Sort
-        if self.algorithm == 'topological_sort':
+        if self.algorithm in ['topological_sort', 'parallel_topological_sort']:
             perm = np.random.permutation(final_n)
             rows, cols = np.nonzero(final_adj)
             for u, v in zip(rows, cols):
@@ -1165,7 +1498,7 @@ class GridGraphSampler:
     def __init__(self, config):
         self.weighted = True 
         self.generate_random_numbers = config.generate_random_numbers
-        
+        self.algorithm = config.algorithm
     def __call__(self, num_nodes):
         side = int(math.sqrt(num_nodes))
         G = nx.grid_2d_graph(side, side)
@@ -1208,7 +1541,7 @@ class GridGraphSampler:
         if self.generate_random_numbers:
             random_numbers = np.random.rand(N, N)
 # Enforce DAG for Topological Sort
-        if config.algorithm == 'topological_sort':
+        if self.algorithm in ['topological_sort', 'parallel_topological_sort']:
             perm = np.random.permutation(N)
             rows, cols = np.nonzero(adj)
             for u, v in zip(rows, cols):
@@ -1226,6 +1559,7 @@ class RoadmapGraphSampler:
     def __init__(self, config):
         self.weighted = True
         self.generate_random_numbers = config.generate_random_numbers
+        self.algorithm = config.algorithm
         
     def __call__(self, num_nodes):
         # Geometric Graph
@@ -1272,7 +1606,7 @@ class RoadmapGraphSampler:
             random_numbers = np.random.rand(N, N)
 
         # Enforce DAG for Topological Sort
-        if config.algorithm == 'topological_sort':
+        if self.algorithm in ['topological_sort', 'parallel_topological_sort']:
             perm = np.random.permutation(N)
             rows, cols = np.nonzero(adj)
             for u, v in zip(rows, cols):
@@ -1281,6 +1615,56 @@ class RoadmapGraphSampler:
 
         return ProblemInstance(adj, start, goal, True, random_numbers, pos=final_pos)
 
+
+def symmetrize_graph_data(node_fts, edge_fts, scalars, edge_index):
+    """
+    Adds reverse edges with zero features to make the graph structurally symmetric.
+    This prevents 'IndexError: pop from an empty deque' in reverse_edge_index.
+    """
+    src, dst = edge_index[0], edge_index[1]
+    
+    # 1. Identify missing reverse edges
+    # Create a set of existing edges
+    edges_set = set(zip(src.tolist(), dst.tolist()))
+    
+    missing_src = []
+    missing_dst = []
+    original_indices = [] # Indices in edge_fts/scalars to map from (we won't use this if just zeroing)
+    
+    # Check if (v, u) exists for each (u, v)
+    for i, (u, v) in enumerate(zip(src.tolist(), dst.tolist())):
+        if u == v: continue
+        if (v, u) not in edges_set:
+            missing_src.append(v)
+            missing_dst.append(u)
+    
+    if not missing_src:
+        return node_fts, edge_fts, scalars, edge_index
+        
+    # 2. Create tensor for new edges
+    new_src = torch.tensor(missing_src, dtype=torch.long)
+    new_dst = torch.tensor(missing_dst, dtype=torch.long)
+    
+    num_new = len(missing_src)
+    
+    # 3. Create zero features
+    # edge_fts shape: [E, T, F]
+    # scalars shape: [E, T, S]
+    T, F_e = edge_fts.shape[1], edge_fts.shape[2]
+    T, S = scalars.shape[1], scalars.shape[2]
+    
+    new_edge_fts = torch.zeros((num_new, T, F_e), dtype=edge_fts.dtype)
+    new_scalars = torch.zeros((num_new, T, S), dtype=scalars.dtype)
+    
+    # 4. Concatenate
+    final_src = torch.cat([src, new_src])
+    final_dst = torch.cat([dst, new_dst])
+    final_edge_index = torch.stack([final_src, final_dst], dim=0)
+    
+    final_edge_fts = torch.cat([edge_fts, new_edge_fts], dim=0)
+    final_scalars = torch.cat([scalars, new_scalars], dim=0)
+    
+    return node_fts, final_edge_fts, final_scalars, final_edge_index
 
 # -----------------------------------------------------------------------------
 # 4. CONFIG & SPECS
@@ -1307,19 +1691,25 @@ SPEC["a_star"] = ((MASK, MASK, MASK), (NODE_POINTER, NODE_POINTER))
 SPEC["eccentricity"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
 # Topological Sort: processed, ready (2 node masks) -> references, self-loops
 SPEC["topological_sort"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
+SPEC["parallel_bfs"] = ((MASK,), (NODE_POINTER, NODE_POINTER))
+SPEC["parallel_topological_sort"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
+SPEC["parallel_mst"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
 
 MAX_NODE_STATES = max(len(s[0]) for s in SPEC.values())
 MAX_EDGE_STATES = max(len(s[1]) for s in SPEC.values())
 
 ALGORITHMS = {
     "bfs": bfs, #==breadth first search
+    "parallel_bfs": parallel_bfs,
     "dfs": dfs, #==depth first search
     "mst": mst, #==PRIM as that is the algorithm used
+    "parallel_mst": parallel_mst,
     "dijkstra": dijkstra, #==SP as that is the algorithm usedf
     "mis": mis, #==maximum independent set
     "a_star": a_star, #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges? no relaxation already possible
     "eccentricity": eccentricity, #==eccentricity of source node (max shorttest distance to reach any other node)
     "topological_sort": topological_sort, #==Kahn's algorithm
+    "parallel_topological_sort": parallel_topological_sort, #==Parallel Kahn's algorithm
 }
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -1394,6 +1784,7 @@ def _worker_logic_chunk(args):
                     'pos': instance.pos,
                     'goal': instance.goal,
                     'start': instance.start,
+                    'algorithm': config.algorithm,
                     'output_type': config.output_type,
                     'output_idx': config.output_idx,
                     't_node': target_node_states,
@@ -1506,11 +1897,17 @@ def _process_worker_result(result):
     node_t = torch.tensor(result['node_fts'], dtype=torch.float32)
     edge_t = torch.tensor(result['edge_fts'], dtype=torch.float32)
     
-    node_t = _pad_features(node_t, result['t_node'])
-    edge_t = _pad_features(edge_t, result['t_edge'])
-    
     scalars_t = torch.tensor(result['scalars'], dtype=torch.float32)
     edge_index_t = torch.tensor(result['edge_index'], dtype=torch.long).contiguous()
+
+    if result['algorithm'] in ['topological_sort', 'parallel_topological_sort']:
+        node_t, edge_t, scalars_t, edge_index_t = symmetrize_graph_data(
+            node_t, edge_t, scalars_t, edge_index_t
+        )
+
+    # Padding after symmetrization
+    node_t = _pad_features(node_t, result['t_node'])
+    edge_t = _pad_features(edge_t, result['t_edge'])
     
     # For scalar output type, y is the final scalar on self-loops
     if result['output_type'] == "scalar":
@@ -1626,9 +2023,21 @@ def _lazy_generate_sample(args):
     edge_fts = np.transpose(edge_fts, (1, 0, 2))  # (E, T, F)
     scalars = np.transpose(scalars, (1, 0, 2))
 
-    # 4. Pad features (multitask safety)
-    node_fts = _pad_features(torch.from_numpy(node_fts), num_node_states).numpy()
-    edge_fts = _pad_features(torch.from_numpy(edge_fts), num_edge_states).numpy()
+    node_t = torch.from_numpy(node_fts).float()
+    edge_t = torch.from_numpy(edge_fts).float()
+    scalars_t = torch.from_numpy(scalars).float()
+    edge_index_t = torch.from_numpy(edge_index).long()
+
+    if algorithm_name in ['topological_sort', 'parallel_topological_sort']:
+        node_t, edge_t, scalars_t, edge_index_t = symmetrize_graph_data(
+            node_t, edge_t, scalars_t, edge_index_t
+        )
+
+    # Pad
+    node_fts = _pad_features(node_t, num_node_states).numpy()
+    edge_fts = _pad_features(edge_t, num_edge_states).numpy()
+    scalars = scalars_t.numpy()
+    edge_index = edge_index_t.numpy()
 
     # Compute y based on output type
     if output_type == "scalar":
@@ -1765,6 +2174,7 @@ class LazyDataset(Dataset):
             y=torch.tensor(c["y"], dtype=torch.long if c["y"].dtype != np.float32 else torch.float32),
             pos=torch.tensor(c["pos"], dtype=torch.float32),
             goal=goal_tensor,
+            start=start_tensor
         )
     
     def iter_batches_as_ready(self, max_batch_size=None, min_batch_size=1):
