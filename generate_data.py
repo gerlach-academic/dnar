@@ -773,6 +773,100 @@ def eccentricity(instance: ProblemInstance):
     
     return np.array(node_states), np.array(edge_states), np.array(scalars)
 
+def topological_sort(instance: ProblemInstance):
+    """
+    Kahn's Algorithm for Topological Sorting.
+    Relies on detecting when in-degree drops to 0. This is the canonical case
+    for needing 'aggregation' (counting) rather than just 'selection'.
+    
+    Node States:
+        - processed: 1 if node is added to sorted order
+        - ready: 1 if node has in-degree 0 and is in queue
+    
+    Scalars:
+        - Current in-degree of the node (normalized)
+    """
+    n = instance.adj.shape[0]
+    node_states = []
+    edge_states = []
+    scalars = []
+    
+    # 1. Compute In-Degrees
+    # We use adj > 0 to handle weighted graphs as simple connectivity
+    # Transpose adj because row=src, col=dst. Sum over rows for each col.
+    adj_bool = (instance.adj > 0).astype(np.int32)
+    in_degree = adj_bool.sum(axis=0)
+    
+    processed = np.zeros(n, dtype=np.int32)
+    ready = np.zeros(n, dtype=np.int32)
+    
+    # Edge states: just Pointers (no changing edge structure usually, but we can pointer to parents)
+    references = np.eye(n, dtype=np.int32) # Identity
+    self_loops = np.eye(n, dtype=np.int32)
+    
+    # Initialize queue with 0-degree nodes
+    queue_list = []
+    for i in range(n):
+        if in_degree[i] == 0:
+            ready[i] = 1
+            queue_list.append(i)
+    
+    def compute_current_scalars(cur_in_degrees):
+        # We pass the current in-degree as a scalar feature on self-loops
+        s = np.zeros(len(instance.edge_index[0]), dtype=np.float32)
+        # Normalize degree roughly so it's not huge
+        norm_deg = cur_in_degrees / max(1.0, n) 
+        
+        # Populate self-loops
+        for i, (src, dst) in enumerate(zip(instance.edge_index[0], instance.edge_index[1])):
+            if src == dst:
+                s[i] = norm_deg[src]
+        return s
+
+    # Initial State
+    push_states(
+        node_states, edge_states, scalars,
+        (processed, ready), (references, self_loops),
+        (compute_current_scalars(in_degree),),
+        edge_index=instance.edge_index
+    )
+    
+    # Process
+    while queue_list:
+        # Sort queue to ensure deterministic tie-breaking (lexicographical topo sort)
+        queue_list.sort() 
+        u = queue_list.pop(0) # Pop smallest index
+        
+        ready[u] = 0
+        processed[u] = 1
+        
+        # simulated "remove edges"
+        for v in instance.out_nodes[u]:
+            if processed[v]: continue
+            
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                ready[v] = 1
+                queue_list.append(v)
+        
+        push_states(
+            node_states, edge_states, scalars,
+            (processed, ready), (references, self_loops),
+            (compute_current_scalars(in_degree),),
+            edge_index=instance.edge_index
+        )
+        
+    # Pad
+    while len(node_states) < n:
+        push_states(
+            node_states, edge_states, scalars,
+            (processed, ready), (references, self_loops),
+            (compute_current_scalars(in_degree),),
+            edge_index=instance.edge_index
+        )
+
+    return np.array(node_states), np.array(edge_states), np.array(scalars)
+
 
 # -----------------------------------------------------------------------------
 # 3. SAMPLERS
@@ -803,6 +897,7 @@ class ErdosRenyiGraphSampler:
     def __init__(self, config):
         self.weighted = config.edge_weights
         self.generate_random_numbers = config.generate_random_numbers
+        self.algorithm = config.algorithm
 
         self.for_astar = (config.algorithm == 'a_star')
 
@@ -843,11 +938,25 @@ class ErdosRenyiGraphSampler:
 
             goal = (start + 1) % num_nodes # Dummy
             
-            # Connectivity check (Scipy) - Faster than BFS simulation
+            # Ensure DAG for Topological Sort
+            if self.algorithm == 'topological_sort':
+                # Remove back-edges relative to a random permutation to guarantee DAG
+                perm = np.random.permutation(num_nodes)
+                # Edge u->v allowed only if perm[u] < perm[v]
+                # This is standard way to generate Random DAGs
+                rows, cols = np.nonzero(adj)
+                for u, v in zip(rows, cols):
+                    if perm[u] >= perm[v]:
+                        adj[u, v] = 0
+                        adj[v, u] = 0 # Undirected base, but here we treat adj as directed
+                
+                # Topological sort works on forests too, no need for connectivity check
+                return ProblemInstance(adj, start, goal, self.weighted, random_numbers, pos=pos)
+            
             n_components = connected_components(csr_matrix(adj), directed=False, return_labels=False)
             if n_components == 1:
                 return ProblemInstance(adj, start, goal, self.weighted, random_numbers, pos=pos)
-
+ 
 class GeometricGraphSampler:
     """
     Generates Random Geometric Graphs (RGG) with 3NN connectivity.
@@ -858,6 +967,7 @@ class GeometricGraphSampler:
     def __init__(self, config):
         self.weighted = True  # A* requires weighted edges
         self.generate_random_numbers = config.generate_random_numbers
+        self.algorithm = config.algorithm
         
     def __call__(self, num_nodes):
         # 1. Generate random coordinates in [0, 1]
@@ -936,6 +1046,15 @@ class GeometricGraphSampler:
         if self.generate_random_numbers:
             random_numbers = np.random.rand(final_n, final_n)
 
+        # Enforce DAG for Topological Sort
+        if self.algorithm == 'topological_sort':
+            perm = np.random.permutation(final_n)
+            rows, cols = np.nonzero(final_adj)
+            for u, v in zip(rows, cols):
+                if perm[u] >= perm[v]:
+                    final_adj[u, v] = 0
+                    # final_adj[v, u] = 0 # No symmetry for directed
+
         # Return the ProblemInstance compatible with your code
         # Pass final_pos so the A* function can calculate h(n)
         return ProblemInstance(
@@ -993,7 +1112,15 @@ class GridGraphSampler:
         random_numbers = None
         if self.generate_random_numbers:
             random_numbers = np.random.rand(N, N)
+# Enforce DAG for Topological Sort
+        if config.algorithm == 'topological_sort':
+            perm = np.random.permutation(N)
+            rows, cols = np.nonzero(adj)
+            for u, v in zip(rows, cols):
+                if perm[u] >= perm[v]:
+                    adj[u, v] = 0
 
+        
         return ProblemInstance(
             adj, start, goal, True, 
             random_numbers,
@@ -1049,6 +1176,14 @@ class RoadmapGraphSampler:
         if self.generate_random_numbers:
             random_numbers = np.random.rand(N, N)
 
+        # Enforce DAG for Topological Sort
+        if config.algorithm == 'topological_sort':
+            perm = np.random.permutation(N)
+            rows, cols = np.nonzero(adj)
+            for u, v in zip(rows, cols):
+                if perm[u] >= perm[v]:
+                    adj[u, v] = 0
+
         return ProblemInstance(adj, start, goal, True, random_numbers, pos=final_pos)
 
 
@@ -1075,6 +1210,8 @@ SPEC["mis"] = ((MASK, MASK, MASK, MASK), (NODE_POINTER,))
 SPEC["a_star"] = ((MASK, MASK, MASK), (NODE_POINTER, NODE_POINTER))
 # Eccentricity: visited, msg_phase (2 node masks) -> tree pointers, self-loops (2 edge pointers)
 SPEC["eccentricity"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
+# Topological Sort: processed, ready (2 node masks) -> references, self-loops
+SPEC["topological_sort"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
 
 MAX_NODE_STATES = max(len(s[0]) for s in SPEC.values())
 MAX_EDGE_STATES = max(len(s[1]) for s in SPEC.values())
@@ -1087,6 +1224,7 @@ ALGORITHMS = {
     "mis": mis, #==maximum independent set
     "a_star": a_star, #TOOD: for a_star we would need to implement edge based reasoning so it can properly compare edges? no relaxation already possible
     "eccentricity": eccentricity, #==eccentricity of source node (max shorttest distance to reach any other node)
+    "topological_sort": topological_sort, #==Kahn's algorithm
 }
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -1267,7 +1405,7 @@ def create_dataloader_distributed(config, split: str, seed: int, num_workers: in
 def _process_worker_result(result):
     """Helper to convert worker output to PyG Data."""
     if 'error' in result:
-        # print(f"Sample failed: {result['error']}") 
+        print(f"Sample failed: {result['error']}") 
         return None
 
     node_t = torch.tensor(result['node_fts'], dtype=torch.float32)

@@ -27,7 +27,7 @@ class Config:
     grokfast_ema:bool = False
     grokfast_window_size:int = 100
     grokfast_alpha:float = 0.98
-    grokfast_lambda:float = 5.0
+    grokfast_lambda:float = 10.0
 
     # --- data ---
     num_samples: dict = None

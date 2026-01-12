@@ -22,4 +22,4 @@ num_edge_states: 1
 output_type: node_mask
 output_idx: 0
 
-wandb_project: dnar_grokking
+project: dnar_grokking

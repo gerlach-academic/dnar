@@ -1,0 +1,29 @@
+algorithm: topological_sort
+
+# --- data ---
+num_samples:
+  train: 10000
+  val: 320
+  test: 320
+
+problem_size:
+  train: 16
+  val: 16
+  test: 64
+
+# --- model ---
+# Topological Sort States:
+# Node: processed (1), ready (1) -> 2 masks
+# Edge: References (1), Self-loops (1) -> 2 pointers
+# But in generate_data.py SPEC["topological_sort"] = ((MASK, MASK), (NODE_POINTER, NODE_POINTER))
+# which implies inputs are mask, mask.
+# Let's verify MASK definition in generate_data.py. Usually MASK=1 dim.
+# (MASK, MASK) -> 2 input dimensions for nodes.
+# (NODE_POINTER, NODE_POINTER) -> 2 dimensions for edge pointers.
+
+num_node_states: 2
+num_edge_states: 2
+
+# Scalar output type for in-degree hints
+output_type: scalar
+output_idx: 0  # We output the in-degree scalar on self-loops

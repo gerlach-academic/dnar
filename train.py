@@ -243,7 +243,7 @@ def evaluate(model, val_data, test_data, metrics_list, model_saver, writer, step
 
     return val_scores, test_scores, val_loss, test_loss
 
-def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
+def train(config: base_config.Config, seed, session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None, num_workers: int = -1):
     device = torch.device(
         ((f"cuda:{gpu_id}" if gpu_id>=0 else "cuda") if gpu_id is not None else get_gpus(1)[0]) 
             if torch.cuda.is_available() else "cpu"
@@ -264,9 +264,9 @@ def train(config: base_config.Config, seed, session: Optional[TrainingSession] =
     model_saver_dir = str(temp_model_dir) if temp_model_dir else config.models_directory
     model_saver = utils.ModelSaver(model_saver_dir, model_name)
 
-    train_data:DataLoader = create_dataloader(config, "train", seed=seed, device=device)
-    val_data:DataLoader = create_dataloader(config, "val", seed=seed + 1, device=device)
-    test_data:DataLoader = create_dataloader(config, "test", seed=seed + 2, device=device)
+    train_data:DataLoader = create_dataloader(config, "train", seed=seed, device=device, num_workers=num_workers if num_workers>0 else None)
+    val_data:DataLoader = create_dataloader(config, "val", seed=seed + 1, device=device, num_workers=num_workers if num_workers>0 else None)
+    test_data:DataLoader = create_dataloader(config, "test", seed=seed + 2, device=device, num_workers=num_workers if num_workers>0 else None)
 
     writer = create_logger(config, model_name, session.get_wandb_run_id() if session else None)
 
@@ -597,7 +597,7 @@ def configs_from_multitask_config(config: base_config.Config) -> List[base_confi
 
 
 def train_multitask(configs: List[base_config.Config], seed: int, 
-                    session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None):
+                    session: Optional[TrainingSession] = None, gpu_id: Optional[int] = None, num_workers: int = -1):
     """
     Multitask training with restart support.
     """
@@ -681,9 +681,9 @@ def train_multitask(configs: List[base_config.Config], seed: int,
         cfg.num_node_states = max_node_states
         cfg.num_edge_states = max_edge_states
         
-        train_dataloaders[cfg.algorithm] = create_dataloader(cfg, "train", seed=seed, device=device)
-        val_dataloaders[cfg.algorithm] = create_dataloader(cfg, "val", seed=seed + 1, device=device)
-        test_dataloaders[cfg.algorithm] = create_dataloader(cfg, "test", seed=seed + 2, device=device)
+        train_dataloaders[cfg.algorithm] = create_dataloader(cfg, "train", seed=seed, device=device, num_workers=num_workers if num_workers>0 else None)
+        val_dataloaders[cfg.algorithm] = create_dataloader(cfg, "val", seed=seed + 1, device=device, num_workers=num_workers if num_workers>0 else None)
+        test_dataloaders[cfg.algorithm] = create_dataloader(cfg, "test", seed=seed + 2, device=device, num_workers=num_workers if num_workers>0 else None)
 
     writer = create_logger(unified_config, model_name, session.get_wandb_run_id() if session else None)
     model.train()
@@ -1181,12 +1181,12 @@ def train_worker(args):
 
     # --- Training ---
     if multitask:
-        model = train_multitask(configs, seed, session=session, gpu_id=gpu_id)
+        model = train_multitask(configs, seed, session=session, gpu_id=gpu_id, num_workers=1)
     else:
         print(f"Train with config {config_path}")
         config = base_config.read_config(config_path)
         config.learning_rate = options.lr if options.lr is not None else config.learning_rate
-        model = train(config, seed, session=session, gpu_id=gpu_id)
+        model = train(config, seed, session=session, gpu_id=gpu_id, num_workers=1)
     return {
         "seed": seed,
         "gpu": gpu_id,

@@ -798,7 +798,7 @@ class DiscreteProcessor(torch.nn.Module):
         if getattr(config, 'attention', 'hard') == 'average':
             self.message_passing = AverageAttentionModule(config)
         elif getattr(config, 'attention','hard') == 'entmax':
-            self.message_passing = EntmaxHardAttention(config)
+            self.message_passing = AlphaEntmaxHardAttention(config)
         else:
             self.message_passing = AttentionModule(config)
 
