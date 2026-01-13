@@ -63,14 +63,14 @@ class Config:
 
     # --- data cache ---
     use_dataset_cache: bool = True
-    cache_directory: str = '/hpcwork/sg114224/dnar_cache'
+    cache_directory: str = 'dataset_cache'
 
     # --- logs, io ---
     models_directory: str = 'models'
     out_directory: str = 'out'
     tensorboard_logs: bool = True
     wandb_logs: bool = True
-    project: str = "str = 'dnar_single_large_lr'"
+    project: str = "dnar"
     wandb_entity: Optional[str] = None  # Your wandb username or team name
 
 
